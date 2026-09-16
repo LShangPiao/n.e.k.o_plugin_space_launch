@@ -1,16 +1,16 @@
 [plugin]
 id = "space_launch"
 name = "太空发射"
-description = "查询下一次及未来多次太空发射任务，并支持检索航天器、火箭型号、空间站、航天机构与 NASA 技术文献。数据来源为 Launch Library 2 API 与 NASA NTRS。由星河拓航工作室 Galaxy Exploration Studio（航天科普组织）开发维护。"
-short_description = "Query upcoming rocket launches and search spacecraft, launchers, space stations, agencies, astronauts and NASA technical literature."
+description = "查询下一次及未来多次太空发射任务，并支持跨来源检索航天资料：航天器、火箭型号、空间站、航天机构、宇航员、中文百科条目、NASA 技术文献与网页兜底搜索。数据来源为 Launch Library 2、NASA NTRS、百度百科与 Bing。由星河拓航工作室 Galaxy Exploration Studio（航天科普组织）开发维护。"
+short_description = "Query upcoming rocket launches and look up spacecraft, launchers, agencies, Chinese encyclopedia entries and NASA literature, with web fallback."
 keywords = [
     "太空", "发射", "火箭", "卫星", "航天", "下一次发射", "空间站", "宇航员", "航天器",
-    "航天机构", "NASA", "文献", "资料", "查卫星",
+    "航天机构", "NASA", "文献", "资料", "查卫星", "百科", "查询", "是什么",
     "space", "launch", "rocket", "satellite", "spaceflight", "spacecraft", "space station",
     "astronaut", "agency", "launchpad", "打ち上げ", "宇宙", "ロケット", "로켓", "발사",
     "космос", "запуск", "спутник"
 ]
-version = "1.1.0"
+version = "1.2.0"
 type = "plugin"
 entry = "plugin.plugins.space_launch:SpaceLaunchPlugin"
 
@@ -31,6 +31,10 @@ auto_start = false
 api_base_url = "https://ll.thespacedevs.com/2.3.0/"
 # NASA 技术报告库（NTRS）基础地址（带尾部斜杠）
 ntrs_base_url = "https://ntrs.nasa.gov/"
+# 百度百科基础地址（中文航天资料）
+baike_base_url = "https://baike.baidu.com/"
+# 网页兜底搜索基础地址
+bing_base_url = "https://cn.bing.com/"
 # 单次请求超时（秒）
 timeout_seconds = 15
 # 默认返回的即将发射数量

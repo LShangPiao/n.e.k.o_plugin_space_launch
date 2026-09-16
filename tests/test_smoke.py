@@ -12,10 +12,14 @@ from plugin.plugins.space_launch import (
     _describe_launch,
     _describe_ll2_entity,
     _describe_ntrs_document,
+    _filter_relevant_web_results,
     _humanize_delta,
     _is_still_upcoming,
     _join_names,
+    _no_result_payload,
+    _parse_bing_rss,
     _parse_iso,
+    _summarize_baike_lemma,
     _summarize_launch,
     _summarize_ll2_entity,
     _summarize_ntrs_document,
@@ -287,3 +291,138 @@ def test_describe_ntrs_document_truncates_abstract() -> None:
     assert "Conference Paper" in text
     assert "…" in text
     assert len(text) < 500
+
+
+# ---------------------------------------------------------------------------
+# 防幻觉：无结果时必须给出明确指引
+# ---------------------------------------------------------------------------
+
+
+def test_no_result_payload_forbids_fabrication() -> None:
+    """没有数据时必须写明“不要编造”，否则 LLM 会用记忆补全细节。"""
+    payload = _no_result_payload(query="UR-700A", label="火箭型号")
+
+    assert payload["found"] is False
+    assert payload["count"] == 0
+    assert payload["results"] == []
+    assert "不要凭猜测" in payload["summary"]
+    assert "绝对不要" in payload["guidance"]
+    assert payload["next_steps"]
+
+
+def test_no_result_payload_includes_suggestions() -> None:
+    payload = _no_result_payload(
+        query="UR-700A",
+        label="火箭型号",
+        suggestions=["UR-700", "N1"],
+    )
+
+    assert payload["suggestions"] == ["UR-700", "N1"]
+    assert any("UR-700" in step for step in payload["next_steps"])
+
+
+# ---------------------------------------------------------------------------
+# 百度百科解析
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_baike_lemma_hit() -> None:
+    raw = {
+        "title": "长征五号",
+        "abstract": "长征五号是中国研制的大型运载火箭。",
+        "url": "http://baike.baidu.com/subview/658465/658465.htm",
+        "image": "//example.invalid/x.jpg",
+    }
+    item = _summarize_baike_lemma(raw, "长征五号")
+
+    assert item is not None
+    assert item["title"] == "长征五号"
+    assert item["abstract"].startswith("长征五号是")
+    assert item["url"].startswith("http://baike")
+    assert item["image"].startswith("https://")
+
+
+def test_summarize_baike_lemma_miss_returns_none() -> None:
+    """百度百科未收录时返回空对象，必须识别为“没查到”。"""
+    assert _summarize_baike_lemma({}, "UR-700A") is None
+
+
+# ---------------------------------------------------------------------------
+# 网页结果相关性过滤
+# ---------------------------------------------------------------------------
+
+
+def test_filter_drops_irrelevant_commercial_results() -> None:
+    """实测 UR-700A 会搜到同名服装品牌，这类结果必须被丢弃。"""
+    items = [
+        {
+            "title": "URBAN REVIVO (UR) 官方商城-PLAY FASHION",
+            "snippet": "UR 官方商城，提供最新时尚服饰和配饰",
+            "url": "https://ur.cn/",
+        },
+        {
+            "title": "UR官方旗舰店 - 淘宝网",
+            "snippet": "欢迎光临 UR 官方旗舰店，提供最新商品价格折扣",
+            "url": "https://taobao.example/",
+        },
+    ]
+    assert _filter_relevant_web_results(items, "UR-700A") == []
+
+
+def test_filter_keeps_aerospace_results() -> None:
+    items = [
+        {
+            "title": "UR-700A 苏联登月火箭方案",
+            "snippet": "这是一种运载火箭，计划用于载人登月任务",
+            "url": "https://example.invalid/ur700a",
+        },
+    ]
+    kept = _filter_relevant_web_results(items, "UR-700A")
+
+    assert len(kept) == 1
+    assert kept[0]["title"].startswith("UR-700A")
+
+
+def test_filter_keeps_generic_aerospace_snippet() -> None:
+    items = [
+        {"title": "某型火箭资料", "snippet": "运载火箭的发射与轨道设计", "url": "u"},
+    ]
+    assert len(_filter_relevant_web_results(items, "UR-700A")) == 1
+
+
+def test_filter_handles_empty_and_tokenless_query() -> None:
+    assert _filter_relevant_web_results([], "UR-700A") == []
+    items = [{"title": "任意标题", "snippet": "无关内容", "url": "u"}]
+    assert _filter_relevant_web_results(items, "") == []
+
+
+# ---------------------------------------------------------------------------
+# Bing RSS 解析
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bing_rss() -> None:
+    xml = """<?xml version="1.0" encoding="utf-8" ?>
+    <rss version="2.0"><channel>
+      <title>必应：测试</title>
+      <item>
+        <title>长征五号 - 维基百科</title>
+        <link>https://example.invalid/cz5</link>
+        <description>长征五号是中国研制的大型运载火箭</description>
+      </item>
+      <item>
+        <title></title>
+        <link></link>
+      </item>
+    </channel></rss>"""
+
+    items = _parse_bing_rss(xml)
+
+    assert len(items) == 1
+    assert items[0]["title"] == "长征五号 - 维基百科"
+    assert items[0]["url"] == "https://example.invalid/cz5"
+
+
+def test_parse_bing_rss_tolerates_invalid_xml() -> None:
+    assert _parse_bing_rss("not xml at all") == []
+    assert _parse_bing_rss("") == []

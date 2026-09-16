@@ -7,6 +7,10 @@ auto_start = false
 api_base_url = "https://ll.thespacedevs.com/2.3.0/"
 # NASA 技术报告库（NTRS）基础地址（带尾部斜杠）
 ntrs_base_url = "https://ntrs.nasa.gov/"
+# 百度百科基础地址（中文航天资料）
+baike_base_url = "https://baike.baidu.com/"
+# 网页兜底搜索基础地址
+bing_base_url = "https://cn.bing.com/"
 # 单次请求超时（秒）
 timeout_seconds = 15
 # 默认返回的即将发射数量

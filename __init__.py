@@ -34,9 +34,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree
 
 import httpx
 from plugin.sdk.plugin import (
@@ -56,7 +58,14 @@ from plugin.sdk.plugin import (
 
 DEFAULT_API_BASE = "https://ll.thespacedevs.com/2.3.0/"
 DEFAULT_NTRS_BASE = "https://ntrs.nasa.gov/"
+DEFAULT_BAIKE_BASE = "https://baike.baidu.com/"
+DEFAULT_BING_BASE = "https://cn.bing.com/"
 _USER_AGENT = "N.E.K.O-space-launch-plugin/1.1 (+https://project-neko.online)"
+# 百度百科与 Bing 会对脚本 UA 做风控，这里使用常规浏览器标识
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 # LL2 中可检索的实体类型 -> (API 路径, 中文名)
 _LL2_SEARCH_TARGETS: Dict[str, Tuple[str, str]] = {
@@ -74,7 +83,49 @@ _MAX_RESULT_LIMIT = 20
 
 
 class _ApiError(Exception):
-    """表示一次 LL2 API 调用失败，携带面向用户的友好信息。"""
+    """表示一次外部 API 调用失败，携带面向用户的友好信息。"""
+
+
+# 检索无结果时给猫娘的明确指引：避免它在没有资料的情况下编造参数。
+_NO_RESULT_GUIDANCE = (
+    "本地数据库没有收录这个条目，因此没有查到任何可靠的参数或数据。"
+    "请直接告诉用户「我这边没有查到」，绝对不要凭猜测描述它的型号、尺寸、"
+    "推力、服役时间等具体信息。"
+)
+
+
+def _no_result_payload(
+    *,
+    query: str,
+    label: str,
+    suggestions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """构造“没有查到”的返回结构。
+
+    关键点是 ``found: False`` 加上显式的禁止编造提示 —— 检索工具返回空结果时，
+    如果只给一句「没找到」，LLM 往往会用训练数据里的记忆去补全细节，
+    这些细节可能是过时或错误的。这里把“不要编造”写进返回值，让模型有据可依。
+    """
+    payload: Dict[str, Any] = {
+        "found": False,
+        "summary": f"没有找到与「{query}」相关的{label}。{_NO_RESULT_GUIDANCE}",
+        "results": [],
+        "count": 0,
+        "total": 0,
+        "guidance": _NO_RESULT_GUIDANCE,
+        "next_steps": [
+            "换用其他关键词或外文原名再试一次",
+            "改用 web_search 插件检索公开资料",
+            "改用 baike_search 检索中文百科条目",
+            "改用 web_fallback_search 获取相关网页链接",
+        ],
+    }
+    if suggestions:
+        payload["suggestions"] = suggestions
+        payload["next_steps"].insert(
+            0, f"尝试相近条目：{'、'.join(suggestions)}"
+        )
+    return payload
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -486,6 +537,137 @@ def _describe_ntrs_list(
     return "\n".join(lines)
 
 
+def _summarize_baike_lemma(raw: Dict[str, Any], query: str) -> Optional[Dict[str, Any]]:
+    """把百度百科条目裁剪成插件结构；未收录时返回 None。
+
+    百度百科的开放接口在“没有该词条”时返回一个空对象（``{}``），
+    用 ``abstract``/``title`` 是否存在即可判断命中与否。
+    """
+    abstract = _as_text(raw.get("abstract"))
+    title = _as_text(raw.get("title")) or _as_text(raw.get("key")) or query
+    if not abstract and not _as_text(raw.get("title")):
+        return None
+
+    image = _as_text(raw.get("image"))
+    if image and image.startswith("//"):
+        image = f"https:{image}"
+
+    return {
+        "source": "百度百科",
+        "title": title,
+        "abstract": abstract,
+        "url": _as_text(raw.get("url")),
+        "image": image,
+    }
+
+
+def _describe_baike_lemma(item: Dict[str, Any]) -> str:
+    """生成百度百科条目的中文描述。"""
+    title = item.get("title") or "未知条目"
+    text = f"百度百科条目「{title}」"
+
+    abstract = item.get("abstract") or ""
+    if abstract:
+        short = abstract if len(abstract) <= 400 else abstract[:400] + "…"
+        text += f"：{short}"
+
+    url = item.get("url") or ""
+    if url:
+        text += f"\n原文：{url}"
+
+    return text
+
+
+def _parse_bing_rss(text: str) -> List[Dict[str, str]]:
+    """解析 Bing 的 RSS 搜索结果。
+
+    使用 ``format=rss`` 而不是解析 HTML：RSS 是稳定的结构化格式，
+    站点改版也不会影响解析。
+    """
+    items: List[Dict[str, str]] = []
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return items
+
+    for node in root.iter("item"):
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip()
+        description = (node.findtext("description") or "").strip()
+        if not title and not link:
+            continue
+        items.append({
+            "title": title,
+            "url": link,
+            "snippet": description,
+        })
+    return items
+
+
+# 网页结果里常见的无关领域词，命中说明搜索结果跑偏了
+_IRRELEVANT_HINTS = (
+    "官方商城", "旗舰店", "服装", "服饰", "女装", "男装", "穿搭", "时尚",
+    "淘宝", "天猫", "京东", "拼多多", "优惠券", "折扣", "购买", "价格",
+    "招聘", "加盟", "贷款", "彩票", "手游", "下载安装",
+)
+# 与航天相关的领域词，命中说明结果至少沾边
+_AEROSPACE_HINTS = (
+    "航天", "火箭", "卫星", "飞船", "空间站", "运载", "发射", "轨道", "探测器",
+    "宇航", "太空", "登月", "导弹", "nasa", "space", "rocket", "satellite",
+    "launch", "orbit", "spacecraft", "spaceflight", "soyuz", "proton", "kosmos",
+)
+
+
+def _filter_relevant_web_results(
+    items: List[Dict[str, str]],
+    query: str,
+) -> List[Dict[str, str]]:
+    """过滤掉明显跑偏的网页结果。
+
+    搜索引擎对生僻的航天型号（例如 ``UR-700A``）容易返回毫不相关的结果
+    （实测会返回同名服装品牌）。把这种结果交给 LLM，比返回空结果更容易
+    造成幻觉，所以这里做一次保守的相关性筛除。
+    """
+    tokens = [t for t in re.split(r"[\s\-_]+", query) if len(t) >= 3]
+    if not tokens:
+        tokens = [query] if query else []
+
+    kept: List[Dict[str, str]] = []
+    for item in items:
+        blob = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+
+        # 命中无关领域词、且完全没有航天线索 -> 丢弃
+        if any(hint in blob for hint in _IRRELEVANT_HINTS):
+            if not any(hint in blob for hint in _AEROSPACE_HINTS):
+                continue
+
+        # 结果至少要沾一点航天边，或者包含查询里的关键片段
+        has_aero = any(hint in blob for hint in _AEROSPACE_HINTS)
+        has_token = any(token.lower() in blob for token in tokens)
+        if not has_aero and not has_token:
+            continue
+
+        kept.append(item)
+
+    return kept
+
+
+def _describe_bing_results(items: List[Dict[str, str]], *, query: str) -> str:
+    """生成网页搜索结果的中文描述。"""
+    if not items:
+        return f"没有找到与「{query}」相关的网页结果。"
+
+    lines = [f"与「{query}」相关的网页结果："]
+    for index, item in enumerate(items, start=1):
+        title = item.get("title") or "（无标题）"
+        lines.append(f"{index}. {title}")
+        snippet = item.get("snippet") or ""
+        if snippet:
+            short = snippet if len(snippet) <= 120 else snippet[:120] + "…"
+            lines.append(f"   {short}")
+    return "\n".join(lines)
+
+
 @neko_plugin
 class SpaceLaunchPlugin(NekoPluginBase):
     """太空发射查询插件。"""
@@ -499,6 +681,8 @@ class SpaceLaunchPlugin(NekoPluginBase):
         self._cfg: Dict[str, Any] = {}
         self._api_base: str = DEFAULT_API_BASE
         self._ntrs_base: str = DEFAULT_NTRS_BASE
+        self._baike_base: str = DEFAULT_BAIKE_BASE
+        self._bing_base: str = DEFAULT_BING_BASE
         self._timeout: float = 15.0
         self._default_limit: int = 5
         self._include_descriptions: bool = True
@@ -729,6 +913,82 @@ class SpaceLaunchPlugin(NekoPluginBase):
 
         return items, total_int
 
+    async def _fetch_baike_lemma(self, query: str) -> Optional[Dict[str, Any]]:
+        """查询百度百科条目摘要，未收录时返回 None。"""
+        base = self._baike_base if self._baike_base.endswith("/") else self._baike_base + "/"
+        url = f"{base}api/openapi/BaikeLemmaCardApi"
+        params = {
+            "scope": 103,
+            "format": "json",
+            "appid": 379020,
+            "bk_key": query,
+            "bk_length": 600,
+        }
+        cache_key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached or None
+
+        client = self._get_client()
+        try:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"User-Agent": _BROWSER_UA},
+            )
+        except httpx.TimeoutException as exc:
+            raise _ApiError(
+                f"请求百度百科超时（{self._timeout:.0f} 秒），请稍后重试。"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise _ApiError(f"无法连接百度百科：{exc}") from exc
+
+        if response.status_code >= 400:
+            raise _ApiError(f"百度百科返回错误状态 {response.status_code}。")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise _ApiError("百度百科返回的内容不是合法 JSON。") from exc
+
+        item = _summarize_baike_lemma(_as_dict(data), query)
+        # 用空 dict 作为“查过但没有”的缓存标记，避免重复请求
+        self._cache_set(cache_key, item if item is not None else {})
+        return item
+
+    async def _search_web(self, query: str, limit: int) -> List[Dict[str, str]]:
+        """通过 Bing RSS 检索网页，返回 [{title, url, snippet}]。"""
+        base = self._bing_base if self._bing_base.endswith("/") else self._bing_base + "/"
+        url = f"{base}search"
+        params = {"q": query, "format": "rss"}
+        cache_key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return list(cached)[:limit]
+
+        client = self._get_client()
+        try:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"User-Agent": _BROWSER_UA},
+            )
+        except httpx.TimeoutException as exc:
+            raise _ApiError(
+                f"请求搜索服务超时（{self._timeout:.0f} 秒），请稍后重试。"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise _ApiError(f"无法连接搜索服务：{exc}") from exc
+
+        if response.status_code >= 400:
+            raise _ApiError(f"搜索服务返回错误状态 {response.status_code}。")
+
+        items = _parse_bing_rss(response.text)
+        self._cache_set(cache_key, items)
+        return _filter_relevant_web_results(items, query)[:limit]
+
     # -- 生命周期 ---------------------------------------------------------
 
     @lifecycle(id="startup")
@@ -748,6 +1008,11 @@ class SpaceLaunchPlugin(NekoPluginBase):
 
         ntrs_base = _as_text(section.get("ntrs_base_url")) or DEFAULT_NTRS_BASE
         self._ntrs_base = ntrs_base
+
+        self._baike_base = (
+            _as_text(section.get("baike_base_url")) or DEFAULT_BAIKE_BASE
+        )
+        self._bing_base = _as_text(section.get("bing_base_url")) or DEFAULT_BING_BASE
 
         try:
             timeout = float(section.get("timeout_seconds", 15))
@@ -1150,6 +1415,7 @@ class SpaceLaunchPlugin(NekoPluginBase):
             return Err(exc)
 
         label = _LL2_SEARCH_TARGETS[category][1]
+        ll2_error = ""
         try:
             items, total = await self._search_ll2_entities(
                 query=query,
@@ -1157,14 +1423,62 @@ class SpaceLaunchPlugin(NekoPluginBase):
                 limit=wanted,
             )
         except _ApiError as exc:
-            self.logger.warning("检索{}失败: {}", label, exc)
-            return Err(SdkError(str(exc)))
-        except Exception as exc:  # pragma: no cover - 兜底
-            self.logger.exception("检索{}时发生未预期错误", label)
-            return Err(SdkError(f"检索{label}失败：{exc}"))
+            # LL2 免费额度很小，429 很常见。这并不代表“这个词条不存在”，
+            # 所以降级到其他来源，而不是直接失败。
+            self.logger.warning("检索{}失败，尝试其他来源: {}", label, exc)
+            items, total = [], 0
+            ll2_error = str(exc)
 
+        # LL2 没结果或不可用时，依次尝试百度百科与网页兜底
         if not items:
-            return Err(SdkError(f"没有找到与「{query}」相关的{label}。"))
+            try:
+                lemma = await self._fetch_baike_lemma(query)
+            except _ApiError as exc:
+                self.logger.warning("百度百科查询失败: {}", exc)
+                lemma = None
+
+            if lemma is not None:
+                self.logger.info("【{}】改由百度百科命中：{}", query, lemma.get("title"))
+                return Ok({
+                    "found": True,
+                    "source": "百度百科",
+                    "summary": _describe_baike_lemma(lemma),
+                    "results": [lemma],
+                    "count": 1,
+                    "total": 1,
+                    "category": category,
+                    "category_label": label,
+                    "note": f"{label}数据库没有收录，以下为百度百科条目。",
+                })
+
+            try:
+                web_items = await self._search_web(query, wanted)
+            except _ApiError as exc:
+                self.logger.warning("网页兜底检索失败: {}", exc)
+                web_items = []
+
+            if web_items:
+                self.logger.info("【{}】改由网页兜底命中 {} 条", query, len(web_items))
+                return Ok({
+                    "found": True,
+                    "source": "网页搜索",
+                    "summary": _describe_bing_results(web_items, query=query),
+                    "results": web_items,
+                    "count": len(web_items),
+                    "total": len(web_items),
+                    "category": category,
+                    "category_label": label,
+                    "note": (
+                        f"{label}数据库没有收录，以下为网页检索结果，"
+                        "请以链接原文为准，不要补充未提及的参数。"
+                    ),
+                })
+
+            self.logger.info("{}未收录「{}」", label, query)
+            payload = _no_result_payload(query=query, label=label)
+            if ll2_error:
+                payload["ll2_error"] = ll2_error
+            return Ok(payload)
 
         self.logger.info("检索到 {} 条{}（关键词：{}）", len(items), label, query)
         return Ok({
@@ -1229,7 +1543,10 @@ class SpaceLaunchPlugin(NekoPluginBase):
             return Err(SdkError(f"检索 NASA 技术文献失败：{exc}"))
 
         if not items:
-            return Err(SdkError(f"没有找到与「{query}」相关的 NASA 技术文献。"))
+            self.logger.info("NTRS 未收录「{}」", query)
+            return Ok(
+                _no_result_payload(query=query, label="NASA 技术文献")
+            )
 
         self.logger.info("检索到 {} 篇 NASA 技术文献（关键词：{}）", len(items), query)
         return Ok({
@@ -1237,6 +1554,116 @@ class SpaceLaunchPlugin(NekoPluginBase):
             "documents": items,
             "count": len(items),
             "total": total,
+        })
+
+    @plugin_entry(
+        id="baike_search",
+        name="中文百科检索",
+        description=(
+            "查询百度百科的中文条目摘要，适合检索中文航天资料，"
+            "例如「长征五号」「东方红一号」「天宫空间站」。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要查询的中文词条名，例如 长征五号",
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+        llm_result_fields=["found", "summary", "title", "abstract", "url"],
+    )
+    async def baike_search(self, query: str, **_):
+        """查询百度百科条目。"""
+        query = _as_text(query)
+        if not query:
+            return Err(SdkError("检索关键词不能为空。"))
+
+        try:
+            item = await self._fetch_baike_lemma(query)
+        except _ApiError as exc:
+            self.logger.warning("百度百科检索失败: {}", exc)
+            return Err(SdkError(str(exc)))
+        except Exception as exc:  # pragma: no cover - 兜底
+            self.logger.exception("百度百科检索时发生未预期错误")
+            return Err(SdkError(f"百度百科检索失败：{exc}"))
+
+        if item is None:
+            self.logger.info("百度百科未收录「{}」", query)
+            return Ok(_no_result_payload(query=query, label="百科条目"))
+
+        self.logger.info("百度百科命中：{}", item.get("title"))
+        return Ok({
+            "found": True,
+            "summary": _describe_baike_lemma(item),
+            "title": item.get("title"),
+            "abstract": item.get("abstract"),
+            "url": item.get("url"),
+            "image": item.get("image"),
+            "source": item.get("source"),
+        })
+
+    @plugin_entry(
+        id="web_fallback_search",
+        name="网页资料兜底检索",
+        description=(
+            "当本地航天数据库和百科都没有收录时，用网页搜索获取相关资料链接。"
+            "返回标题、链接与摘要，便于进一步查阅原文。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词，例如 UR-700A 火箭",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-10，默认 5",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+        llm_result_fields=["found", "summary", "results", "count"],
+    )
+    async def web_fallback_search(self, query: str, limit: Any = 5, **_):
+        """网页兜底检索。"""
+        query = _as_text(query)
+        if not query:
+            return Err(SdkError("检索关键词不能为空。"))
+
+        try:
+            wanted = _coerce_limit(limit, 5)
+        except SdkError as exc:
+            return Err(exc)
+
+        try:
+            items = await self._search_web(query, wanted)
+        except _ApiError as exc:
+            self.logger.warning("网页检索失败: {}", exc)
+            return Err(SdkError(str(exc)))
+        except Exception as exc:  # pragma: no cover - 兜底
+            self.logger.exception("网页检索时发生未预期错误")
+            return Err(SdkError(f"网页检索失败：{exc}"))
+
+        if not items:
+            self.logger.info("网页检索无结果：「{}」", query)
+            return Ok(
+                _no_result_payload(query=query, label="网页结果")
+            )
+
+        self.logger.info("网页检索到 {} 条（关键词：{}）", len(items), query)
+        return Ok({
+            "found": True,
+            "summary": _describe_bing_results(items, query=query),
+            "results": items,
+            "count": len(items),
         })
 
     @llm_tool(
@@ -1312,10 +1739,14 @@ class SpaceLaunchPlugin(NekoPluginBase):
             return {"output": None, "is_error": True, "error": str(exc)}
 
         if not items:
-            return {"output": {"summary": f"没有找到与「{query}」相关的{label}。"}}
+            return {
+                "output": _no_result_payload(query=query, label=label),
+                "is_error": False,
+            }
 
         return {
             "output": {
+                "found": True,
                 "summary": _describe_ll2_list(items, query=query, label=label),
                 "details": [_describe_ll2_entity(item) for item in items],
                 "total": total,
@@ -1371,16 +1802,122 @@ class SpaceLaunchPlugin(NekoPluginBase):
 
         if not items:
             return {
-                "output": {"summary": f"没有找到与「{query}」相关的 NASA 技术文献。"}
+                "output": _no_result_payload(query=query, label="NASA 技术文献"),
+                "is_error": False,
             }
 
         return {
             "output": {
+                "found": True,
                 "summary": _describe_ntrs_list(items, query=query),
                 "details": [_describe_ntrs_document(item) for item in items],
                 "total": total,
             }
         }
+
+    @llm_tool(
+        name="lookup_space_info",
+        description=(
+            "查询任何航天相关名词的权威资料，会自动依次检索航天数据库、"
+            "中文百科与网页。当用户询问某个火箭、卫星、航天器、机构或型号"
+            "（例如「UR-700A 是什么」「长征五号」）时优先调用这个工具。"
+            "如果三个来源都没有结果，返回值会明确说明未收录，请如实告诉用户。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要查询的航天名词，中文或英文均可",
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=45,
+    )
+    async def lookup_space_info(self, query: str, **kwargs: Any) -> Dict[str, Any]:
+        """LLM 工具：跨来源综合查询。
+
+        按「航天数据库 -> 中文百科 -> 网页」的顺序依次尝试，任一来源命中即返回，
+        避免让模型在没有资料时凭空作答。
+        """
+        query = _as_text(query)
+        if not query:
+            return {"output": None, "is_error": True, "error": "检索关键词不能为空。"}
+
+        attempts: List[str] = []
+
+        # 1) Launch Library 2：先按航天器查，再按火箭型号查
+        for category in ("spacecraft", "launcher"):
+            label = _LL2_SEARCH_TARGETS[category][1]
+            try:
+                items, total = await self._search_ll2_entities(
+                    query=query,
+                    category=category,
+                    limit=3,
+                )
+            except Exception as exc:
+                attempts.append(f"{label}：查询失败（{type(exc).__name__}）")
+                continue
+            if items:
+                return {
+                    "output": {
+                        "found": True,
+                        "source": f"Launch Library 2（{label}）",
+                        "summary": _describe_ll2_list(
+                            items, query=query, label=label
+                        ),
+                        "details": [_describe_ll2_entity(i) for i in items],
+                        "total": total,
+                    }
+                }
+            attempts.append(f"{label}：未收录")
+
+        # 2) 百度百科（中文资料覆盖面更广）
+        try:
+            lemma = await self._fetch_baike_lemma(query)
+        except Exception:
+            lemma = None
+            attempts.append("百度百科：查询失败")
+        else:
+            if lemma is not None:
+                return {
+                    "output": {
+                        "found": True,
+                        "source": "百度百科",
+                        "summary": _describe_baike_lemma(lemma),
+                        "url": lemma.get("url"),
+                    }
+                }
+            attempts.append("百度百科：未收录")
+
+        # 3) 网页兜底
+        try:
+            web_items = await self._search_web(query, 5)
+        except Exception:
+            web_items = []
+            attempts.append("网页搜索：查询失败")
+        else:
+            if web_items:
+                return {
+                    "output": {
+                        "found": True,
+                        "source": "网页搜索",
+                        "summary": _describe_bing_results(web_items, query=query),
+                        "results": web_items,
+                        "note": "以下为网页检索结果，请以链接原文为准，不要补充未提及的参数。",
+                    }
+                }
+            attempts.append("网页搜索：无结果")
+
+        self.logger.info("综合查询未命中「{}」：{}", query, "；".join(attempts))
+        payload = _no_result_payload(query=query, label="资料")
+        payload["attempts"] = attempts
+        payload["summary"] = (
+            f"三个来源都没有查到「{query}」：{'；'.join(attempts)}。"
+            f"{_NO_RESULT_GUIDANCE}"
+        )
+        return {"output": payload, "is_error": False}
 
 
 __all__ = ["SpaceLaunchPlugin"]
