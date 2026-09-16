@@ -1,0 +1,16 @@
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[space_launch]
+# Launch Library 2 API 基础地址（带尾部斜杠）
+api_base_url = "https://ll.thespacedevs.com/2.3.0/"
+# 单次请求超时（秒）
+timeout_seconds = 15
+# 默认返回的即将发射数量
+default_limit = 5
+# 是否在下次发射/列表中附带任务描述
+include_descriptions = true
+# API 响应的内存缓存时间（秒）。Launch Library 2 免费额度约每小时 15 次请求，
+# 建议不要设置得过小。
+cache_ttl_seconds = 300

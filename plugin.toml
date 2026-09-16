@@ -1,0 +1,37 @@
+[plugin]
+id = "space_launch"
+name = "太空发射"
+description = "查询下一次及未来多次太空发射任务信息，数据来源为 Launch Library 2 API（https://thespacedevs.com/llapi）。可以查询下一次发射、即将发射的列表、以及按火箭或机构筛选。由星河拓航工作室 Galaxy Exploration Studio（航天科普组织）开发维护。"
+short_description = "Query next and upcoming rocket launches from the Launch Library 2 API."
+keywords = [
+    "太空", "发射", "火箭", "卫星", "航天", "下一次发射", "space", "launch", "rocket",
+    "satellite", "spaceflight", "打ち上げ", "宇宙", "로켓", "발사", "launchpad",
+    "космос", "запуск", "спутник"
+]
+version = "1.0.0"
+type = "plugin"
+entry = "plugin.plugins.space_launch:SpaceLaunchPlugin"
+
+[plugin.author]
+name = "星河拓航工作室 (Galaxy Exploration Studio)"
+email = "1565873375@qq.com"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[space_launch]
+# Launch Library 2 API 基础地址（带尾部斜杠）
+api_base_url = "https://ll.thespacedevs.com/2.3.0/"
+# 单次请求超时（秒）
+timeout_seconds = 15
+# 默认返回的即将发射数量
+default_limit = 5
+# 是否在下次发射/列表中附带任务描述
+include_descriptions = true
+# API 响应的内存缓存时间（秒）
+cache_ttl_seconds = 300
