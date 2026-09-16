@@ -55,7 +55,17 @@ from plugin.sdk.plugin import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_API_BASE = "https://ll.thespacedevs.com/2.3.0/"
-_USER_AGENT = "N.E.K.O-space-launch-plugin/1.0 (+https://project-neko.online)"
+DEFAULT_NTRS_BASE = "https://ntrs.nasa.gov/"
+_USER_AGENT = "N.E.K.O-space-launch-plugin/1.1 (+https://project-neko.online)"
+
+# LL2 中可检索的实体类型 -> (API 路径, 中文名)
+_LL2_SEARCH_TARGETS: Dict[str, Tuple[str, str]] = {
+    "spacecraft": ("spacecraft_configurations/", "航天器"),
+    "launcher": ("launcher_configurations/", "火箭型号"),
+    "station": ("space_stations/", "空间站"),
+    "agency": ("agencies/", "航天机构"),
+    "astronaut": ("astronauts/", "宇航员"),
+}
 
 # 本地筛选时最多向 API 请求的条目数，避免一次拉取过多数据
 _MAX_FETCH_LIMIT = 50
@@ -278,6 +288,204 @@ def _describe_launch_list(items: List[Dict[str, Any]]) -> str:
 # 插件主体
 # ---------------------------------------------------------------------------
 
+def _join_names(values: Any) -> str:
+    """把 LL2 的 ``[{"name": ...}]`` 这类列表拼成顿号分隔的字符串。"""
+    if not isinstance(values, list):
+        return ""
+    names = [_as_text(_as_dict(item).get("name")) for item in values]
+    return "、".join(name for name in names if name)
+
+
+def _summarize_ll2_entity(raw: Dict[str, Any], category: str) -> Dict[str, Any]:
+    """把 LL2 搜索命中的实体裁剪成插件自己的结构。"""
+    image = _as_dict(raw.get("image"))
+    item: Dict[str, Any] = {
+        "category": category,
+        "category_label": _LL2_SEARCH_TARGETS.get(category, ("", category))[1],
+        "name": _as_text(raw.get("name")),
+        "description": _as_text(raw.get("description")),
+        "image": _as_text(image.get("image_url")),
+        "url": _as_text(raw.get("url")),
+    }
+
+    if category == "spacecraft":
+        item["type"] = _as_text(_as_dict(raw.get("type")).get("name"))
+        item["agency"] = _as_text(_as_dict(raw.get("agency")).get("name"))
+        item["in_use"] = bool(raw.get("in_use"))
+        item["family"] = _join_names(raw.get("family"))
+        families = raw.get("family")
+        if isinstance(families, list) and families:
+            item["maiden_flight"] = _as_text(
+                _as_dict(families[0]).get("maiden_flight")
+            )
+    elif category == "launcher":
+        item["full_name"] = _as_text(raw.get("full_name"))
+        item["family"] = _as_text(raw.get("family"))
+        item["variant"] = _as_text(raw.get("variant"))
+        item["manufacturer"] = _as_text(
+            _as_dict(raw.get("manufacturer")).get("name")
+        )
+        item["maiden_flight"] = _as_text(raw.get("maiden_flight"))
+    elif category == "station":
+        item["status"] = _as_text(_as_dict(raw.get("status")).get("name"))
+        item["orbit"] = _as_text(raw.get("orbit"))
+        item["founded"] = _as_text(raw.get("founded"))
+        item["owners"] = _join_names(raw.get("owners"))
+        item["crew_size"] = raw.get("crew_size")
+    elif category == "agency":
+        item["abbrev"] = _as_text(raw.get("abbrev"))
+        item["type"] = _as_text(_as_dict(raw.get("type")).get("name"))
+        item["country"] = _join_names(raw.get("country"))
+        item["founding_year"] = _as_text(raw.get("founding_year"))
+        item["administrator"] = _as_text(raw.get("administrator"))
+    elif category == "astronaut":
+        item["status"] = _as_text(_as_dict(raw.get("status")).get("name"))
+        item["nationality"] = _as_text(raw.get("nationality"))
+        item["agency"] = _as_text(_as_dict(raw.get("agency")).get("name"))
+        item["flights_count"] = raw.get("flights_count")
+        item["bio"] = _as_text(raw.get("bio"))
+
+    return item
+
+
+def _describe_ll2_entity(item: Dict[str, Any]) -> str:
+    """生成一条 LL2 实体的中文描述。"""
+    label = item.get("category_label") or "条目"
+    name = item.get("name") or "未知"
+    text = f"{label}「{name}」"
+
+    details: List[str] = []
+    for field, prefix in (
+        ("type", "类型"),
+        ("abbrev", "缩写"),
+        ("agency", "所属机构"),
+        ("manufacturer", "制造商"),
+        ("family", "系列"),
+        ("country", "国家/地区"),
+        ("status", "状态"),
+        ("orbit", "轨道"),
+        ("founding_year", "成立年份"),
+        ("founded", "成立"),
+        ("maiden_flight", "首飞"),
+        ("nationality", "国籍"),
+        ("administrator", "负责人"),
+    ):
+        value = item.get(field)
+        if value in (None, "", 0):
+            continue
+        details.append(f"{prefix}{value}")
+
+    if details:
+        text += "：" + "；".join(details)
+
+    description = item.get("description") or item.get("bio") or ""
+    if description:
+        text += f"。{description}"
+
+    return text
+
+
+def _describe_ll2_list(
+    items: List[Dict[str, Any]],
+    *,
+    query: str,
+    label: str,
+) -> str:
+    """生成 LL2 搜索结果的简短列表描述。"""
+    if not items:
+        return f"没有找到与「{query}」相关的{label}。"
+
+    lines = [f"找到 {len(items)} 条与「{query}」相关的{label}："]
+    for index, item in enumerate(items, start=1):
+        name = item.get("name") or "未知"
+        extra = item.get("type") or item.get("abbrev") or item.get("agency") or ""
+        suffix = f"（{extra}）" if extra else ""
+        lines.append(f"{index}. {name}{suffix}")
+    return "\n".join(lines)
+
+
+def _summarize_ntrs_document(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把 NASA NTRS 技术文献裁剪成插件自己的结构。"""
+    authors: List[str] = []
+    for entry in raw.get("authorAffiliations") or []:
+        meta = _as_dict(_as_dict(entry).get("meta"))
+        name = _as_text(_as_dict(meta.get("author")).get("name"))
+        if name:
+            authors.append(name)
+
+    downloads = raw.get("downloads") or []
+    full_text_url = ""
+    if isinstance(downloads, list) and downloads:
+        links = _as_dict(_as_dict(downloads[0]).get("links"))
+        full_text_url = _as_text(links.get("fulltext")) or _as_text(links.get("pdf"))
+    if full_text_url.startswith("/"):
+        full_text_url = f"{DEFAULT_NTRS_BASE.rstrip('/')}{full_text_url}"
+
+    doc_id = raw.get("id")
+    return {
+        "title": _as_text(raw.get("title")),
+        "abstract": _as_text(raw.get("abstract")),
+        "authors": authors,
+        "center": _as_text(_as_dict(raw.get("center")).get("name")),
+        "document_type": _as_text(raw.get("stiTypeDetails"))
+        or _as_text(raw.get("stiType")),
+        "published": _as_text(raw.get("distributionDate"))
+        or _as_text(raw.get("created")),
+        "keywords": [k for k in (raw.get("keywords") or []) if isinstance(k, str)],
+        "subject_categories": [
+            c for c in (raw.get("subjectCategories") or []) if isinstance(c, str)
+        ],
+        "document_id": doc_id,
+        "url": f"{DEFAULT_NTRS_BASE}citations/{doc_id}" if doc_id else "",
+        "full_text_url": full_text_url,
+    }
+
+
+def _describe_ntrs_document(item: Dict[str, Any]) -> str:
+    """生成一篇 NTRS 文献的中文描述。"""
+    title = item.get("title") or "未知文献"
+    text = f"NASA 技术文献《{title}》"
+
+    authors = item.get("authors") or []
+    if authors:
+        shown = "、".join(authors[:3])
+        more = " 等" if len(authors) > 3 else ""
+        text += f"，作者：{shown}{more}"
+
+    center = item.get("center") or ""
+    if center:
+        text += f"，所属中心：{center}"
+
+    doc_type = item.get("document_type") or ""
+    if doc_type:
+        text += f"，类型：{doc_type}"
+
+    abstract = item.get("abstract") or ""
+    if abstract:
+        short = abstract if len(abstract) <= 240 else abstract[:240] + "…"
+        text += f"。摘要：{short}"
+
+    return text
+
+
+def _describe_ntrs_list(
+    items: List[Dict[str, Any]],
+    *,
+    query: str,
+) -> str:
+    """生成 NTRS 搜索结果的简短列表描述。"""
+    if not items:
+        return f"没有找到与「{query}」相关的 NASA 技术文献。"
+
+    lines = [f"找到 {len(items)} 篇与「{query}」相关的 NASA 技术文献："]
+    for index, item in enumerate(items, start=1):
+        title = item.get("title") or "未知文献"
+        center = item.get("center") or ""
+        suffix = f"（{center}）" if center else ""
+        lines.append(f"{index}. {title}{suffix}")
+    return "\n".join(lines)
+
+
 @neko_plugin
 class SpaceLaunchPlugin(NekoPluginBase):
     """太空发射查询插件。"""
@@ -290,6 +498,7 @@ class SpaceLaunchPlugin(NekoPluginBase):
         # 运行配置（在 startup 中从 self.config 读取）
         self._cfg: Dict[str, Any] = {}
         self._api_base: str = DEFAULT_API_BASE
+        self._ntrs_base: str = DEFAULT_NTRS_BASE
         self._timeout: float = 15.0
         self._default_limit: int = 5
         self._include_descriptions: bool = True
@@ -340,18 +549,28 @@ class SpaceLaunchPlugin(NekoPluginBase):
             self._cache.clear()
         self._cache[key] = (time.monotonic() + self._cache_ttl, value)
 
-    async def _request_json(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """请求 LL2 接口并返回解析后的 JSON。
+    async def _request_json(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        base_url: Optional[str] = None,
+        service: str = "Launch Library 2",
+    ) -> Dict[str, Any]:
+        """请求外部 JSON 接口。
 
         成功结果会按 TTL 缓存，失败抛出 :class:`_ApiError`。
+        ``base_url`` 省略时使用 Launch Library 2 的地址；``service``
+        只用于拼装面向用户的错误信息。
         """
-        base = self._api_base if self._api_base.endswith("/") else self._api_base + "/"
+        raw_base = base_url or self._api_base
+        base = raw_base if raw_base.endswith("/") else raw_base + "/"
         url = f"{base}{path.lstrip('/')}"
         cache_key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
 
         cached = self._cache_get(cache_key)
         if cached is not None:
-            self.logger.debug("LL2 命中缓存: {}", cache_key)
+            self.logger.debug("{} 命中缓存: {}", service, cache_key)
             return cached
 
         client = self._get_client()
@@ -359,27 +578,27 @@ class SpaceLaunchPlugin(NekoPluginBase):
             response = await client.get(url, params=params)
         except httpx.TimeoutException as exc:
             raise _ApiError(
-                f"请求 Launch Library 2 超时（{self._timeout:.0f} 秒），请稍后重试。"
+                f"请求 {service} 超时（{self._timeout:.0f} 秒），请稍后重试。"
             ) from exc
         except httpx.HTTPError as exc:
-            raise _ApiError(f"无法连接 Launch Library 2：{exc}") from exc
+            raise _ApiError(f"无法连接 {service}：{exc}") from exc
 
         if response.status_code == 429:
-            raise _ApiError(
-                "Launch Library 2 免费额度已用完（约每小时 15 次请求），请稍后再试。"
-            )
+            if base_url is None:
+                raise _ApiError(
+                    "Launch Library 2 免费额度已用完（约每小时 15 次请求），请稍后再试。"
+                )
+            raise _ApiError(f"{service} 请求过于频繁，请稍后再试。")
         if response.status_code >= 400:
-            raise _ApiError(
-                f"Launch Library 2 返回错误状态 {response.status_code}。"
-            )
+            raise _ApiError(f"{service} 返回错误状态 {response.status_code}。")
 
         try:
             data = response.json()
         except ValueError as exc:
-            raise _ApiError("Launch Library 2 返回的内容不是合法 JSON。") from exc
+            raise _ApiError(f"{service} 返回的内容不是合法 JSON。") from exc
 
         if not isinstance(data, dict):
-            raise _ApiError("Launch Library 2 返回了非预期的数据结构。")
+            raise _ApiError(f"{service} 返回了非预期的数据结构。")
 
         self._cache_set(cache_key, data)
         return data
@@ -445,6 +664,71 @@ class SpaceLaunchPlugin(NekoPluginBase):
 
         return items[:limit]
 
+    async def _search_ll2_entities(
+        self,
+        *,
+        query: str,
+        category: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """在 LL2 指定端点中检索实体，返回 (结果列表, 命中总数)。"""
+        path, label = _LL2_SEARCH_TARGETS[category]
+        payload = await self._request_json(
+            path,
+            {"search": query, "limit": limit, "mode": "normal"},
+        )
+
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise _ApiError(f"Launch Library 2 没有返回{label}的 results 字段。")
+
+        items = [
+            _summarize_ll2_entity(_as_dict(raw), category)
+            for raw in results
+            if isinstance(raw, dict)
+        ]
+
+        total = payload.get("count")
+        try:
+            total_int = int(total) if total is not None else len(items)
+        except (TypeError, ValueError):
+            total_int = len(items)
+
+        return items, total_int
+
+    async def _search_ntrs_documents(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """检索 NASA NTRS 技术文献，返回 (结果列表, 命中总数)。"""
+        payload = await self._request_json(
+            "api/citations/search",
+            {"q": query, "page.size": limit},
+            base_url=self._ntrs_base,
+            service="NASA NTRS",
+        )
+
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise _ApiError("NASA NTRS 没有返回 results 字段。")
+
+        items = [
+            _summarize_ntrs_document(_as_dict(raw))
+            for raw in results
+            if isinstance(raw, dict)
+        ]
+
+        stats = _as_dict(payload.get("stats"))
+        total = stats.get("total")
+        try:
+            total_int = int(total) if total is not None else len(items)
+        except (TypeError, ValueError):
+            total_int = len(items)
+
+        return items, total_int
+
     # -- 生命周期 ---------------------------------------------------------
 
     @lifecycle(id="startup")
@@ -461,6 +745,9 @@ class SpaceLaunchPlugin(NekoPluginBase):
 
         api_base = _as_text(section.get("api_base_url")) or DEFAULT_API_BASE
         self._api_base = api_base
+
+        ntrs_base = _as_text(section.get("ntrs_base_url")) or DEFAULT_NTRS_BASE
+        self._ntrs_base = ntrs_base
 
         try:
             timeout = float(section.get("timeout_seconds", 15))
@@ -797,6 +1084,301 @@ class SpaceLaunchPlugin(NekoPluginBase):
                     for item in items
                 ],
                 "count": len(items),
+            }
+        }
+
+    @plugin_entry(
+        id="search_space_objects",
+        name="航天器与机构检索",
+        description=(
+            "在 Launch Library 2 数据库中检索航天器、火箭型号、空间站、航天机构或宇航员的资料，"
+            "返回名称、类型、所属机构、系列、首飞时间等结构化信息。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词，例如 Dragon、Falcon 9、ISS、NASA",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "spacecraft",
+                        "launcher",
+                        "station",
+                        "agency",
+                        "astronaut",
+                    ],
+                    "description": (
+                        "检索类别：spacecraft=航天器（默认）、launcher=火箭型号、"
+                        "station=空间站、agency=航天机构、astronaut=宇航员"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认使用插件配置值",
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+        llm_result_fields=["summary", "results", "count", "total", "category_label"],
+    )
+    async def search_space_objects(
+        self,
+        query: str,
+        category: str = "spacecraft",
+        limit: Any = None,
+        **_,
+    ):
+        """检索 LL2 中的航天实体资料。"""
+        query = _as_text(query)
+        if not query:
+            return Err(SdkError("检索关键词不能为空。"))
+
+        category = _as_text(category).lower() or "spacecraft"
+        if category not in _LL2_SEARCH_TARGETS:
+            allowed = "、".join(_LL2_SEARCH_TARGETS)
+            return Err(SdkError(f"不支持的检索类别：{category}。可选：{allowed}"))
+
+        try:
+            wanted = _coerce_limit(limit, self._default_limit)
+        except SdkError as exc:
+            return Err(exc)
+
+        label = _LL2_SEARCH_TARGETS[category][1]
+        try:
+            items, total = await self._search_ll2_entities(
+                query=query,
+                category=category,
+                limit=wanted,
+            )
+        except _ApiError as exc:
+            self.logger.warning("检索{}失败: {}", label, exc)
+            return Err(SdkError(str(exc)))
+        except Exception as exc:  # pragma: no cover - 兜底
+            self.logger.exception("检索{}时发生未预期错误", label)
+            return Err(SdkError(f"检索{label}失败：{exc}"))
+
+        if not items:
+            return Err(SdkError(f"没有找到与「{query}」相关的{label}。"))
+
+        self.logger.info("检索到 {} 条{}（关键词：{}）", len(items), label, query)
+        return Ok({
+            "summary": _describe_ll2_list(items, query=query, label=label),
+            "results": items,
+            "count": len(items),
+            "total": total,
+            "category": category,
+            "category_label": label,
+        })
+
+    @plugin_entry(
+        id="search_nasa_documents",
+        name="NASA 技术文献检索",
+        description=(
+            "在 NASA 技术报告库（NTRS）中检索航天相关的技术文献、会议论文与报告，"
+            "返回标题、摘要、作者、所属研究中心与全文链接。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "检索关键词，建议使用英文术语，"
+                        "例如 James Webb Space Telescope、ion thruster"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认使用插件配置值",
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+        llm_result_fields=["summary", "documents", "count", "total"],
+    )
+    async def search_nasa_documents(self, query: str, limit: Any = None, **_):
+        """检索 NASA 技术文献。"""
+        query = _as_text(query)
+        if not query:
+            return Err(SdkError("检索关键词不能为空。"))
+
+        try:
+            wanted = _coerce_limit(limit, self._default_limit)
+        except SdkError as exc:
+            return Err(exc)
+
+        try:
+            items, total = await self._search_ntrs_documents(
+                query=query,
+                limit=wanted,
+            )
+        except _ApiError as exc:
+            self.logger.warning("检索 NASA 技术文献失败: {}", exc)
+            return Err(SdkError(str(exc)))
+        except Exception as exc:  # pragma: no cover - 兜底
+            self.logger.exception("检索 NASA 技术文献时发生未预期错误")
+            return Err(SdkError(f"检索 NASA 技术文献失败：{exc}"))
+
+        if not items:
+            return Err(SdkError(f"没有找到与「{query}」相关的 NASA 技术文献。"))
+
+        self.logger.info("检索到 {} 篇 NASA 技术文献（关键词：{}）", len(items), query)
+        return Ok({
+            "summary": _describe_ntrs_list(items, query=query),
+            "documents": items,
+            "count": len(items),
+            "total": total,
+        })
+
+    @llm_tool(
+        name="search_space_knowledge",
+        description=(
+            "在航天数据库中检索航天器、火箭、空间站、航天机构或宇航员的资料。"
+            "当用户询问「猎鹰九号是什么火箭」「国际空间站的信息」「NASA 是什么机构」"
+            "这类问题时调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词，例如 Falcon 9、ISS、NASA、Soyuz",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "spacecraft",
+                        "launcher",
+                        "station",
+                        "agency",
+                        "astronaut",
+                    ],
+                    "description": (
+                        "检索类别：spacecraft=航天器（默认）、launcher=火箭型号、"
+                        "station=空间站、agency=航天机构、astronaut=宇航员"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认 3",
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+    )
+    async def search_space_knowledge(
+        self,
+        query: str,
+        category: str = "spacecraft",
+        limit: Any = 3,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LLM 工具：检索航天实体资料。"""
+        query = _as_text(query)
+        if not query:
+            return {"output": None, "is_error": True, "error": "检索关键词不能为空。"}
+
+        category = _as_text(category).lower() or "spacecraft"
+        if category not in _LL2_SEARCH_TARGETS:
+            return {
+                "output": None,
+                "is_error": True,
+                "error": f"不支持的检索类别：{category}",
+            }
+
+        try:
+            wanted = _coerce_limit(limit, 3)
+        except SdkError as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        label = _LL2_SEARCH_TARGETS[category][1]
+        try:
+            items, total = await self._search_ll2_entities(
+                query=query,
+                category=category,
+                limit=wanted,
+            )
+        except Exception as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        if not items:
+            return {"output": {"summary": f"没有找到与「{query}」相关的{label}。"}}
+
+        return {
+            "output": {
+                "summary": _describe_ll2_list(items, query=query, label=label),
+                "details": [_describe_ll2_entity(item) for item in items],
+                "total": total,
+                "category_label": label,
+            }
+        }
+
+    @llm_tool(
+        name="search_nasa_literature",
+        description=(
+            "在 NASA 技术报告库中检索航天技术文献与论文。"
+            "当用户想深入了解某项航天技术的原理或研究资料时调用，关键词建议使用英文。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词（建议英文），例如 ion thruster、reentry",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认 3",
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+    )
+    async def search_nasa_literature(
+        self,
+        query: str,
+        limit: Any = 3,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LLM 工具：检索 NASA 技术文献。"""
+        query = _as_text(query)
+        if not query:
+            return {"output": None, "is_error": True, "error": "检索关键词不能为空。"}
+
+        try:
+            wanted = _coerce_limit(limit, 3)
+        except SdkError as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        try:
+            items, total = await self._search_ntrs_documents(
+                query=query,
+                limit=wanted,
+            )
+        except Exception as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        if not items:
+            return {
+                "output": {"summary": f"没有找到与「{query}」相关的 NASA 技术文献。"}
+            }
+
+        return {
+            "output": {
+                "summary": _describe_ntrs_list(items, query=query),
+                "details": [_describe_ntrs_document(item) for item in items],
+                "total": total,
             }
         }
 

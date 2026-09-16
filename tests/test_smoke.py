@@ -10,10 +10,15 @@ import pytest
 from plugin.plugins.space_launch import (
     _coerce_limit,
     _describe_launch,
+    _describe_ll2_entity,
+    _describe_ntrs_document,
     _humanize_delta,
     _is_still_upcoming,
+    _join_names,
     _parse_iso,
     _summarize_launch,
+    _summarize_ll2_entity,
+    _summarize_ntrs_document,
 )
 from plugin.sdk.plugin import SdkError
 
@@ -137,3 +142,148 @@ def test_describe_launch_mentions_key_facts() -> None:
     assert "SpaceX" in text
     assert "Vandenberg SFB, CA, USA" in text
     assert "Go for Launch" in text
+
+
+# ---------------------------------------------------------------------------
+# LL2 实体检索
+# ---------------------------------------------------------------------------
+
+_SPACECRAFT_SAMPLE = {
+    "name": "Cargo Dragon 2",
+    "type": {"name": "Capsule"},
+    "agency": {"name": "SpaceX"},
+    "in_use": True,
+    "family": [{"name": "Dragon", "maiden_flight": "2010-12-08"}],
+    "image": {"image_url": "https://example.invalid/dragon.jpg"},
+    "url": "https://ll.thespacedevs.com/2.3.0/spacecraft_configurations/7/",
+}
+
+
+def test_join_names_builds_enumeration() -> None:
+    assert _join_names([{"name": "NASA"}, {"name": "ESA"}]) == "NASA、ESA"
+    assert _join_names([{"name": "NASA"}, {"other": 1}]) == "NASA"
+    assert _join_names(None) == ""
+    assert _join_names("not-a-list") == ""
+
+
+def test_summarize_ll2_spacecraft() -> None:
+    item = _summarize_ll2_entity(_SPACECRAFT_SAMPLE, "spacecraft")
+
+    assert item["category"] == "spacecraft"
+    assert item["category_label"] == "航天器"
+    assert item["name"] == "Cargo Dragon 2"
+    assert item["type"] == "Capsule"
+    assert item["agency"] == "SpaceX"
+    assert item["family"] == "Dragon"
+    assert item["maiden_flight"] == "2010-12-08"
+    assert item["in_use"] is True
+    assert item["image"].endswith("dragon.jpg")
+
+
+def test_summarize_ll2_agency() -> None:
+    raw = {
+        "name": "National Aeronautics and Space Administration",
+        "abbrev": "NASA",
+        "type": {"name": "Government"},
+        "country": [{"name": "United States of America"}],
+        "founding_year": 1958,
+        "administrator": "Administrator: Example",
+    }
+    item = _summarize_ll2_entity(raw, "agency")
+
+    assert item["category_label"] == "航天机构"
+    assert item["abbrev"] == "NASA"
+    assert item["type"] == "Government"
+    assert item["country"] == "United States of America"
+    assert item["founding_year"] == "1958"
+    assert item["administrator"] == "Administrator: Example"
+
+
+def test_summarize_ll2_entity_tolerates_missing_fields() -> None:
+    item = _summarize_ll2_entity({}, "launcher")
+
+    assert item["name"] == ""
+    assert item["image"] == ""
+    assert item["category"] == "launcher"
+    assert item["category_label"] == "火箭型号"
+
+
+def test_describe_ll2_entity_mentions_details() -> None:
+    raw = dict(_SPACECRAFT_SAMPLE)
+    raw["description"] = "A reusable cargo spacecraft."
+    text = _describe_ll2_entity(_summarize_ll2_entity(raw, "spacecraft"))
+
+    assert "航天器「Cargo Dragon 2」" in text
+    assert "Capsule" in text
+    assert "SpaceX" in text
+    assert "A reusable cargo spacecraft." in text
+
+
+# ---------------------------------------------------------------------------
+# NASA NTRS 文献检索
+# ---------------------------------------------------------------------------
+
+_NTRS_SAMPLE = {
+    "id": 20150017756,
+    "title": "Seasonal Variations of the JWST Orbital Dynamics",
+    "abstract": "We investigate the variability of the observatory trajectory.",
+    "authorAffiliations": [
+        {"meta": {"author": {"name": "Brown, Jonathan"}}},
+        {"meta": {"author": {"name": "Petersen, Jeremy"}}},
+    ],
+    "center": {"name": "Marshall Space Flight Center"},
+    "stiTypeDetails": "Conference Paper",
+    "keywords": ["launch windows", 123],
+    "downloads": [
+        {"links": {"fulltext": "/api/citations/20150017756/downloads/x.txt"}}
+    ],
+}
+
+
+def test_summarize_ntrs_document() -> None:
+    item = _summarize_ntrs_document(_NTRS_SAMPLE)
+
+    assert item["title"] == "Seasonal Variations of the JWST Orbital Dynamics"
+    assert item["authors"] == ["Brown, Jonathan", "Petersen, Jeremy"]
+    assert item["center"] == "Marshall Space Flight Center"
+    assert item["document_type"] == "Conference Paper"
+    assert item["keywords"] == ["launch windows"]
+    assert item["document_id"] == 20150017756
+    assert item["url"] == "https://ntrs.nasa.gov/citations/20150017756"
+    assert item["full_text_url"].startswith("https://ntrs.nasa.gov/api/")
+
+
+def test_summarize_ntrs_document_keeps_absolute_links() -> None:
+    raw = {
+        "id": 1,
+        "downloads": [{"links": {"pdf": "https://example.invalid/paper.pdf"}}],
+    }
+    item = _summarize_ntrs_document(raw)
+    assert item["full_text_url"] == "https://example.invalid/paper.pdf"
+
+
+def test_summarize_ntrs_document_tolerates_missing_fields() -> None:
+    item = _summarize_ntrs_document({})
+
+    assert item["title"] == ""
+    assert item["authors"] == []
+    assert item["url"] == ""
+    assert item["full_text_url"] == ""
+
+
+def test_describe_ntrs_document_truncates_abstract() -> None:
+    item = {
+        "title": "A Long Paper",
+        "authors": ["A", "B", "C", "D"],
+        "center": "JPL",
+        "document_type": "Conference Paper",
+        "abstract": "x" * 500,
+    }
+    text = _describe_ntrs_document(item)
+
+    assert "A Long Paper" in text
+    assert "A、B、C 等" in text
+    assert "JPL" in text
+    assert "Conference Paper" in text
+    assert "…" in text
+    assert len(text) < 500

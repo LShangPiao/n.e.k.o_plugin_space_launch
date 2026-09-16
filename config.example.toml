@@ -5,6 +5,8 @@ auto_start = false
 [space_launch]
 # Launch Library 2 API 基础地址（带尾部斜杠）
 api_base_url = "https://ll.thespacedevs.com/2.3.0/"
+# NASA 技术报告库（NTRS）基础地址（带尾部斜杠）
+ntrs_base_url = "https://ntrs.nasa.gov/"
 # 单次请求超时（秒）
 timeout_seconds = 15
 # 默认返回的即将发射数量

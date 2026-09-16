@@ -8,9 +8,13 @@
   由 <b>星河拓航工作室</b>（Galaxy Exploration Studio）开发与维护
 </p>
 
-查询全球**下一次**以及未来即将进行的太空发射任务。
+查询全球**下一次**以及未来即将进行的太空发射任务，并支持检索航天器、火箭、空间站、
+航天机构、宇航员与 NASA 技术文献。
 
-数据来源：[Launch Library 2 API](https://thespacedevs.com/llapi)（The Space Devs，免费开放）。
+数据来源：
+
+- [Launch Library 2 API](https://thespacedevs.com/llapi)（The Space Devs，免费开放）
+- [NASA NTRS](https://ntrs.nasa.gov/)（NASA 技术报告库，纯文字文献）
 
 ## 功能
 
@@ -18,12 +22,26 @@
 | --- | --- | --- |
 | `next_launch` | 下一次太空发射 | 返回下一次发射的任务名、火箭、服务商、本地时间、倒计时、发射场与任务简介 |
 | `upcoming_launches` | 即将进行的发射列表 | 返回未来 1–20 次发射，可按服务商 / 火箭 / 发射场筛选 |
+| `search_space_objects` | 航天器与机构检索 | 在 LL2 中检索航天器 / 火箭型号 / 空间站 / 航天机构 / 宇航员 |
+| `search_nasa_documents` | NASA 技术文献检索 | 在 NASA NTRS 中检索技术报告与会议论文（纯文字，含摘要与全文链接） |
 | `launch_stats` | 发射数据概览 | 返回即将进行的发射总数与当前 API 配置 |
 
-同时注册了两个供猫娘在对话中主动调用的 LLM 工具：
+`search_space_objects` 的 `category` 参数可选值：
+
+| category | 检索对象 | 示例 |
+| --- | --- | --- |
+| `spacecraft`（默认） | 航天器 | Cargo Dragon 2 |
+| `launcher` | 火箭型号 | Falcon 9 |
+| `station` | 空间站 | ISS |
+| `agency` | 航天机构 | NASA、CNSA |
+| `astronaut` | 宇航员 | — |
+
+同时注册了四个供猫娘在对话中主动调用的 LLM 工具：
 
 - `get_next_space_launch` —— 回答“下一次火箭发射是什么时候”
 - `list_upcoming_space_launches` —— 回答“接下来有哪些发射任务”
+- `search_space_knowledge` —— 回答“猎鹰九号是什么火箭”“国际空间站的资料”
+- `search_nasa_literature` —— 回答“某项航天技术的原理 / 研究资料”
 
 ## 目录结构
 
@@ -34,7 +52,7 @@ space_launch/
 ├── pyproject.toml         # 项目元数据（供 neko-plugin CLI 使用）
 ├── __init__.py            # 插件实现
 ├── README.md
-├── LICENSE                # Apache License 2.0
+├── LICENSE                # GNU General Public License v3.0
 ├── ruff.toml              # 代码检查配置
 ├── assets/
 │   └── icon.jpg           # 星河拓航工作室图标
@@ -51,6 +69,7 @@ space_launch/
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `api_base_url` | `https://ll.thespacedevs.com/2.3.0/` | LL2 接口基础地址 |
+| `ntrs_base_url` | `https://ntrs.nasa.gov/` | NASA NTRS 接口基础地址 |
 | `timeout_seconds` | `15` | 单次请求超时（3–60 秒） |
 | `default_limit` | `5` | 列表默认返回条数 |
 | `include_descriptions` | `true` | 是否附带任务描述 |
