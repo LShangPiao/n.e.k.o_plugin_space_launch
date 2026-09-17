@@ -156,6 +156,7 @@ uv run pytest plugin/plugins/space_launch/tests -q
 
 - 官方网站：<https://xhth.top/>
 - B 站主页：<https://space.bilibili.com/3546949529635067>
+- 联系邮箱：<contact@xhth.top>
 
 欢迎航天爱好者加入交流，也欢迎反馈插件的问题与建议。
 
