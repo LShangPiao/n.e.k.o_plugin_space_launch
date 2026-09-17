@@ -1,20 +1,25 @@
 # 太空发射（Space Launch）
 
 <p align="center">
-  <img src="assets/icon.jpg" alt="星河拓航工作室 Galaxy Exploration Studio" width="180">
+  <img src="assets/icon.jpg" alt="星河拓航Studio Galaxy Exploration Studio" width="180">
 </p>
 
 <p align="center">
-  由 <b>星河拓航工作室</b>（Galaxy Exploration Studio）开发与维护
+  由 <b>星河拓航Studio</b>（Galaxy Exploration Studio）开发与维护
 </p>
 
-查询全球**下一次**以及未来即将进行的太空发射任务，并支持检索航天器、火箭、空间站、
-航天机构、宇航员与 NASA 技术文献。
+查询全球**下一次**以及未来即将进行的太空发射任务，并支持跨来源检索航天资料：
+航天器、火箭型号、空间站、航天机构、宇航员、中文百科条目、NASA 技术文献，
+以及网页兜底搜索。
 
 数据来源：
 
-- [Launch Library 2 API](https://thespacedevs.com/llapi)（The Space Devs，免费开放）
-- [NASA NTRS](https://ntrs.nasa.gov/)（NASA 技术报告库，纯文字文献）
+| 来源 | 用途 |
+| --- | --- |
+| [Launch Library 2 API](https://thespacedevs.com/llapi) | 发射计划、航天器、火箭、机构、宇航员（The Space Devs，免费开放） |
+| [NASA NTRS](https://ntrs.nasa.gov/) | NASA 技术报告与会议论文（纯文字文献） |
+| [百度百科](https://baike.baidu.com/) | 中文航天条目（国内可直连） |
+| [Bing](https://cn.bing.com/) | 上述来源都查不到时的网页兜底搜索 |
 
 ## 功能
 
@@ -24,6 +29,8 @@
 | `upcoming_launches` | 即将进行的发射列表 | 返回未来 1–20 次发射，可按服务商 / 火箭 / 发射场筛选 |
 | `search_space_objects` | 航天器与机构检索 | 在 LL2 中检索航天器 / 火箭型号 / 空间站 / 航天机构 / 宇航员 |
 | `search_nasa_documents` | NASA 技术文献检索 | 在 NASA NTRS 中检索技术报告与会议论文（纯文字，含摘要与全文链接） |
+| `baike_search` | 中文百科检索 | 在百度百科中检索中文航天条目 |
+| `web_fallback_search` | 网页兜底搜索 | 前几个来源都查不到时，用 Bing 做一次网页搜索 |
 | `launch_stats` | 发射数据概览 | 返回即将进行的发射总数与当前 API 配置 |
 
 `search_space_objects` 的 `category` 参数可选值：
@@ -36,12 +43,15 @@
 | `agency` | 航天机构 | NASA、CNSA |
 | `astronaut` | 宇航员 | — |
 
-同时注册了四个供猫娘在对话中主动调用的 LLM 工具：
+同时注册了五个供猫娘在对话中主动调用的 LLM 工具：
 
-- `get_next_space_launch` —— 回答“下一次火箭发射是什么时候”
-- `list_upcoming_space_launches` —— 回答“接下来有哪些发射任务”
-- `search_space_knowledge` —— 回答“猎鹰九号是什么火箭”“国际空间站的资料”
-- `search_nasa_literature` —— 回答“某项航天技术的原理 / 研究资料”
+| 工具 | 回答什么问题 |
+| --- | --- |
+| `get_next_space_launch` | “下一次火箭发射是什么时候” |
+| `list_upcoming_space_launches` | “接下来有哪些发射任务” |
+| `search_space_knowledge` | “猎鹰九号是什么火箭”“国际空间站的资料” |
+| `search_nasa_literature` | “某项航天技术的原理 / 研究资料” |
+| `lookup_space_info` | 综合检索：先在 LL2、百度百科里找，都没有再走网页兜底 |
 
 ## 目录结构
 
@@ -55,7 +65,7 @@ space_launch/
 ├── LICENSE                # GNU General Public License v3.0
 ├── ruff.toml              # 代码检查配置
 ├── assets/
-│   └── icon.jpg           # 星河拓航工作室图标
+│   └── icon.jpg           # 星河拓航Studio 图标
 ├── tests/
 │   └── test_smoke.py
 └── .github/workflows/     # 标准 CI（verify.yml / release.yml）
@@ -70,6 +80,8 @@ space_launch/
 | --- | --- | --- |
 | `api_base_url` | `https://ll.thespacedevs.com/2.3.0/` | LL2 接口基础地址 |
 | `ntrs_base_url` | `https://ntrs.nasa.gov/` | NASA NTRS 接口基础地址 |
+| `baike_base_url` | `https://baike.baidu.com/` | 百度百科基础地址（中文航天资料） |
+| `bing_base_url` | `https://cn.bing.com/` | 网页兜底搜索基础地址 |
 | `timeout_seconds` | `15` | 单次请求超时（3–60 秒） |
 | `default_limit` | `5` | 列表默认返回条数 |
 | `include_descriptions` | `true` | 是否附带任务描述 |
@@ -123,11 +135,23 @@ uv run pytest plugin/plugins/space_launch/tests -q
 在 N.E.K.O. 的插件页面刷新列表后启动插件，切换到「入口点」即可触发
 **下一次太空发射**。
 
-## 关于星河拓航工作室
+## 关于「不会瞎编」
 
-本插件由 **星河拓航工作室**（**Galaxy Exploration Studio**）开发与维护。
+航天资料最怕模型**编**——编出来的推力、尺寸、服役时间看着都很像真的，但会误导人。
+所以插件在做不到的时候会明确说做不到，而不是让模型自由发挥：
 
-星河拓航工作室是一个由来自五湖四海的航天爱好者组成的非正式线上航天科普组织，
+- **查不到条目** → 返回 `found: false` 并附一段明确引导：
+  「本地数据库没有收录这个条目……请直接告诉用户『我这边没有查到』，
+  绝对不要凭猜测描述它的型号、尺寸、推力、服役时间等具体信息。」
+- **搜索结果不相关** → 会被相关性过滤掉。例如搜「UR-700A」时 Bing 返回的是
+  服装品牌 URBAN REVIVO 的页面，这类命中会被丢弃而不是当作结果交上去
+- **接口失败 / 超时** → 如实返回错误，不会用上一次的缓存冒充新数据
+
+## 关于星河拓航Studio
+
+本插件由 **星河拓航Studio**（Galaxy Exploration Studio）开发与维护。
+
+星河拓航Studio 是一个由来自五湖四海的航天爱好者组成的非正式线上航天科普组织，
 成员多为在校学生。我们希望通过有趣、可靠的方式，让更多人了解真实的航天发射任务。
 
 - 官方网站：<https://xhth.top/>
@@ -142,6 +166,8 @@ uv run pytest plugin/plugins/space_launch/tests -q
 - `launches/upcoming/` 端点偶尔会返回刚刚发射完、状态尚未刷新的任务（例如已标记为
   `Launch Successful` 却仍排在列表开头的记录）。插件会过滤掉这些条目，确保
   「下一次太空发射」指向的确实是还没发射的任务；发射时间待定的任务排在列表末尾。
+- 只使用**国内可直连**的来源（LL2 / NASA NTRS / 百度百科 / Bing）。
+  Wikipedia 与 Wikidata 因需要代理，未被纳入。
 
 ## 许可证
 
