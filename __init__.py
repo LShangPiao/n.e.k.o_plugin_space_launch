@@ -41,7 +41,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
 
 import httpx
-
 from plugin.sdk.plugin import (
     Err,
     NekoPluginBase,
