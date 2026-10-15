@@ -16,16 +16,27 @@
 
 """Space Launch Plugin（太空发射）
 
-查询全球下一次及未来即将进行的太空发射任务。
+查询全球下一次及未来即将进行的太空发射任务，并跨来源检索航天资料。
 
-数据来源：Launch Library 2 API
-- 官网：https://thespacedevs.com/llapi
-- 接口：https://ll.thespacedevs.com/2.3.0/launches/upcoming/
+数据来源：
+- Launch Library 2 API   https://thespacedevs.com/llapi
+                         https://ll.thespacedevs.com/2.3.0/launches/upcoming/
+- NASA NTRS              https://ntrs.nasa.gov/
+- 百度百科                https://baike.baidu.com/
+- 卫星百科（灰机wiki）    https://sat.huijiwiki.com/
+- Bing 网页兜底           https://cn.bing.com/
+（以上均为国内可直连来源；Wikipedia / Wikidata 需要代理，未纳入。）
 
 功能：
-- next_launch          查询"下一次太空发射"（核心功能）
-- upcoming_launches    查询未来多次发射，支持按发射服务商 / 火箭 / 发射场筛选
-- 以及两个供猫娘在对话中主动调用的 LLM 工具
+- next_launch            查询「下一次太空发射」（核心功能）
+- upcoming_launches      查询未来多次发射，支持按发射服务商 / 火箭 / 发射场筛选
+- search_space_objects   检索航天器 / 火箭型号 / 空间站 / 航天机构 / 宇航员
+- search_nasa_documents  检索 NASA 技术报告与会议论文
+- baike_search           检索百度百科中文条目
+- sat_wiki_search        检索卫星百科（灰机wiki）中文条目
+- web_fallback_search    网页兜底搜索
+- launch_stats           发射数据概览
+- 以及六个供猫娘在对话中主动调用的 LLM 工具。
 
 说明：Launch Library 2 免费额度约为每小时 15 次请求，因此插件内置了
 带 TTL 的内存缓存来避免重复请求。
@@ -34,10 +45,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 from xml.etree import ElementTree
 
 import httpx
@@ -60,8 +73,10 @@ DEFAULT_API_BASE = "https://ll.thespacedevs.com/2.3.0/"
 DEFAULT_NTRS_BASE = "https://ntrs.nasa.gov/"
 DEFAULT_BAIKE_BASE = "https://baike.baidu.com/"
 DEFAULT_BING_BASE = "https://cn.bing.com/"
-_USER_AGENT = "N.E.K.O-space-launch-plugin/1.1 (+https://project-neko.online)"
-# 百度百科与 Bing 会对脚本 UA 做风控，这里使用常规浏览器标识
+# 国内卫星百科（灰机wiki / sat.huijiwiki.com），中文航天资料覆盖面广
+DEFAULT_HUIJIWIKI_BASE = "https://sat.huijiwiki.com/"
+_USER_AGENT = "N.E.K.O-space-launch-plugin/1.3 (+https://project-neko.online)"
+# 百度百科、Bing 与卫星百科（灰机wiki）会对脚本 UA 做风控，这里使用常规浏览器标识
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -117,6 +132,7 @@ def _no_result_payload(
             "换用其他关键词或外文原名再试一次",
             "改用 web_search 插件检索公开资料",
             "改用 baike_search 检索中文百科条目",
+            "改用 sat_wiki_search 检索国内卫星百科（灰机wiki）条目",
             "改用 web_fallback_search 获取相关网页链接",
         ],
     }
@@ -668,6 +684,110 @@ def _describe_bing_results(items: List[Dict[str, str]], *, query: str) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# 卫星百科（灰机wiki / sat.huijiwiki.com）检索
+# ---------------------------------------------------------------------------
+
+# 卫星百科（灰机wiki）的官方名称，用于返回结构与日志
+_SAT_WIKI_SOURCE = "卫星百科（灰机wiki）"
+
+# 灰机wiki 站点启用了 Cloudflare 托管挑战（Managed Challenge）。被拦截时接口
+# 返回的是 HTTP 403 + HTML 挑战页（响应头带 ``cf-mitigated: challenge``），
+# 而不是 JSON。必须把这种情况和「接口真的报错」区分开：否则只会抛出一句
+# 没有信息量的「返回错误状态 403」，用户既不知道是风控，也不知道该换条路。
+_CLOUDFLARE_CHALLENGE_HINTS = (
+    "just a moment",
+    "challenges.cloudflare.com",
+    "cf-chl",
+    "cf_clearance",
+)
+
+
+def _looks_like_cloudflare_challenge(response: Any) -> bool:
+    """判断响应是否为 Cloudflare 风控挑战页。
+
+    先看 ``cf-mitigated`` 响应头（Cloudflare 拦截时会置为 ``challenge``），
+    再看 ``server: cloudflare`` 加挑战页正文特征。任一命中即认为是风控拦截。
+    """
+    headers = getattr(response, "headers", None)
+    try:
+        if headers is not None:
+            mitigated = str(headers.get("cf-mitigated", "") or "").lower()
+            if "challenge" in mitigated:
+                return True
+            server = str(headers.get("server", "") or "").lower()
+            if "cloudflare" not in server:
+                return False
+        body = str(getattr(response, "text", "") or "")[:4000].lower()
+        return any(hint in body for hint in _CLOUDFLARE_CHALLENGE_HINTS)
+    except Exception:  # pragma: no cover - 头部/正文读取异常不应影响主流程
+        return False
+
+
+def _strip_wiki_snippet(text: str) -> str:
+    """去掉 MediaWiki 搜索摘要里的 HTML 标签并反转义实体。
+
+    灰机wiki 的搜索摘要会带 ``<span class="searchmatch">…</span>`` 高亮，
+    以及 ``&quot;``、``&#39;`` 之类的实体。这里只保留纯文本，便于朗读与展示。
+    """
+    if not text:
+        return ""
+    # 去掉所有标签（含 searchmatch 高亮），再反转义 HTML 实体
+    cleaned = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(cleaned).strip()
+
+
+def _summarize_sat_wiki(raw: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    """把卫星百科（灰机wiki）的搜索结果裁剪成插件结构。"""
+    title = _as_text(raw.get("title"))
+    snippet = _strip_wiki_snippet(_as_text(raw.get("snippet")))
+    encoded = quote(title, safe="")
+    url = f"{base_url.rstrip('/')}/wiki/{encoded}"
+    return {
+        "source": _SAT_WIKI_SOURCE,
+        "title": title,
+        "snippet": snippet,
+        "pageid": raw.get("pageid"),
+        "url": url,
+        "wordcount": raw.get("wordcount"),
+        "size": raw.get("size"),
+        "timestamp": _as_text(raw.get("timestamp")),
+    }
+
+
+def _describe_sat_wiki_item(item: Dict[str, Any]) -> str:
+    """生成卫星百科单条条目的中文描述。"""
+    title = item.get("title") or "未知条目"
+    text = f"{_SAT_WIKI_SOURCE}条目「{title}」"
+
+    snippet = item.get("snippet") or ""
+    if snippet:
+        short = snippet if len(snippet) <= 400 else snippet[:400] + "…"
+        text += f"：{short}"
+
+    url = item.get("url") or ""
+    if url:
+        text += f"\n原文：{url}"
+
+    return text
+
+
+def _describe_sat_wiki_list(items: List[Dict[str, Any]], *, query: str) -> str:
+    """生成卫星百科搜索结果的简短列表描述。"""
+    if not items:
+        return f"没有找到与「{query}」相关的卫星百科条目。"
+
+    lines = [f"{_SAT_WIKI_SOURCE}中与「{query}」相关的 {len(items)} 个条目："]
+    for index, item in enumerate(items, start=1):
+        title = item.get("title") or "未知"
+        lines.append(f"{index}. {title}")
+        snippet = item.get("snippet") or ""
+        if snippet:
+            short = snippet if len(snippet) <= 120 else snippet[:120] + "…"
+            lines.append(f"   {short}")
+    return "\n".join(lines)
+
+
 @neko_plugin
 class SpaceLaunchPlugin(NekoPluginBase):
     """太空发射查询插件。"""
@@ -683,6 +803,7 @@ class SpaceLaunchPlugin(NekoPluginBase):
         self._ntrs_base: str = DEFAULT_NTRS_BASE
         self._baike_base: str = DEFAULT_BAIKE_BASE
         self._bing_base: str = DEFAULT_BING_BASE
+        self._huijiwiki_base: str = DEFAULT_HUIJIWIKI_BASE
         self._timeout: float = 15.0
         self._default_limit: int = 5
         self._include_descriptions: bool = True
@@ -989,6 +1110,97 @@ class SpaceLaunchPlugin(NekoPluginBase):
         self._cache_set(cache_key, items)
         return _filter_relevant_web_results(items, query)[:limit]
 
+    async def _search_sat_wiki(
+        self,
+        *,
+        query: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """检索卫星百科（sat.huijiwiki.com / 灰机wiki），返回 (结果列表, 命中总数)。
+
+        灰机wiki 是 MediaWiki，直接用其 ``api.php`` 的 ``list=search`` 接口拿
+        结构化 JSON，比解析搜索结果页（CustomSearch / Special:Search）更稳。
+        站点开启了 Cloudflare 风控，偶尔会把脚本请求拦成 HTML 挑战页，
+        这种情况会被识别为「暂时无法访问」而不是当作空结果。
+        """
+        base = (
+            self._huijiwiki_base
+            if self._huijiwiki_base.endswith("/")
+            else self._huijiwiki_base + "/"
+        )
+        url = f"{base}api.php"
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srnamespace": "0",
+            "srwhat": "text",
+            "srlimit": limit,
+            "format": "json",
+        }
+        cache_key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            cached_items, cached_total = cached
+            return list(cached_items)[:limit], cached_total
+
+        client = self._get_client()
+        try:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"User-Agent": _BROWSER_UA},
+            )
+        except httpx.TimeoutException as exc:
+            raise _ApiError(
+                f"请求卫星百科超时（{self._timeout:.0f} 秒），请稍后重试。"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise _ApiError(f"无法连接卫星百科：{exc}") from exc
+
+        if _looks_like_cloudflare_challenge(response):
+            raise _ApiError(
+                f"卫星百科（灰机wiki）暂时无法访问：站点风控拦截了本次请求"
+                f"（HTTP {response.status_code}）。这通常发生在机房 / 代理 IP 上，"
+                f"家用宽带一般不受影响。可以稍后重试，或先用 baike_search "
+                f"检索百度百科条目。"
+            )
+        if response.status_code == 429:
+            raise _ApiError("卫星百科请求过于频繁，请稍后再试。")
+        if response.status_code >= 400:
+            raise _ApiError(f"卫星百科返回错误状态 {response.status_code}。")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            # 极端情况下风控页没有带挑战特征头，只能靠「JSON 解析失败」兜底
+            raise _ApiError(
+                "卫星百科（灰机wiki）暂时无法访问，返回内容不是合法 JSON，"
+                "可能被风控拦截。可以稍后重试，或先用 baike_search 检索百度百科条目。"
+            ) from exc
+
+        query_obj = _as_dict(data.get("query"))
+        search_list = query_obj.get("search")
+        if not isinstance(search_list, list):
+            raise _ApiError("卫星百科返回了非预期的数据结构。")
+
+        items = [
+            _summarize_sat_wiki(_as_dict(raw), base)
+            for raw in search_list
+            if isinstance(raw, dict)
+        ]
+
+        searchinfo = _as_dict(query_obj.get("searchinfo"))
+        total = searchinfo.get("totalhits")
+        try:
+            total_int = int(total) if total is not None else len(items)
+        except (TypeError, ValueError):
+            total_int = len(items)
+
+        self._cache_set(cache_key, (items, total_int))
+        return items[:limit], total_int
+
     # -- 生命周期 ---------------------------------------------------------
 
     @lifecycle(id="startup")
@@ -1013,6 +1225,10 @@ class SpaceLaunchPlugin(NekoPluginBase):
             _as_text(section.get("baike_base_url")) or DEFAULT_BAIKE_BASE
         )
         self._bing_base = _as_text(section.get("bing_base_url")) or DEFAULT_BING_BASE
+
+        self._huijiwiki_base = (
+            _as_text(section.get("huijiwiki_base_url")) or DEFAULT_HUIJIWIKI_BASE
+        )
 
         try:
             timeout = float(section.get("timeout_seconds", 15))
@@ -1666,6 +1882,130 @@ class SpaceLaunchPlugin(NekoPluginBase):
             "count": len(items),
         })
 
+    @plugin_entry(
+        id="sat_wiki_search",
+        name="卫星百科检索",
+        description=(
+            "检索国内卫星百科（sat.huijiwiki.com / 灰机wiki）的中文航天条目，"
+            "覆盖火箭、卫星、航天器、发射场、航天机构与任务等。"
+            "适合回答「风云四号是什么卫星」「长征七号」「文昌发射场」"
+            "这类中文航天百科问题。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要检索的中文词条或关键词，例如 风云卫星、长征五号、文昌发射场",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认使用插件配置值",
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+        llm_result_fields=["found", "summary", "results", "count", "total"],
+    )
+    async def sat_wiki_search(self, query: str, limit: Any = None, **_):
+        """检索卫星百科（灰机wiki）条目。"""
+        query = _as_text(query)
+        if not query:
+            return Err(SdkError("检索关键词不能为空。"))
+
+        try:
+            wanted = _coerce_limit(limit, self._default_limit)
+        except SdkError as exc:
+            return Err(exc)
+
+        try:
+            items, total = await self._search_sat_wiki(query=query, limit=wanted)
+        except _ApiError as exc:
+            self.logger.warning("卫星百科检索失败: {}", exc)
+            return Err(SdkError(str(exc)))
+        except Exception as exc:  # pragma: no cover - 兜底
+            self.logger.exception("卫星百科检索时发生未预期错误")
+            return Err(SdkError(f"卫星百科检索失败：{exc}"))
+
+        if not items:
+            self.logger.info("卫星百科未收录「{}」", query)
+            return Ok(_no_result_payload(query=query, label="卫星百科条目"))
+
+        self.logger.info("卫星百科命中 {} 条（关键词：{}）", len(items), query)
+        return Ok({
+            "found": True,
+            "source": _SAT_WIKI_SOURCE,
+            "summary": _describe_sat_wiki_list(items, query=query),
+            "results": items,
+            "count": len(items),
+            "total": total,
+        })
+
+    @llm_tool(
+        name="lookup_satellite_wiki",
+        description=(
+            "检索国内卫星百科（sat.huijiwiki.com / 灰机wiki）的中文航天条目，"
+            "涵盖火箭、卫星、航天器、发射场、航天机构等权威中文资料。"
+            "当用户提到具体的中文航天名词（如「风云四号」「长征七号」"
+            "「文昌发射场」「神舟飞船」）并想了解其资料时调用。"
+            "若卫星百科没有结果，返回值会明确说明未收录，请如实告诉用户。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要查询的卫星/火箭/航天器/发射场中文名称或关键词",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数，1-20，默认 3",
+                },
+            },
+            "required": ["query"],
+        },
+        timeout=30,
+    )
+    async def lookup_satellite_wiki(
+        self,
+        query: str,
+        limit: Any = 3,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """LLM 工具：检索卫星百科（灰机wiki）条目。"""
+        query = _as_text(query)
+        if not query:
+            return {"output": None, "is_error": True, "error": "检索关键词不能为空。"}
+
+        try:
+            wanted = _coerce_limit(limit, 3)
+        except SdkError as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        try:
+            items, total = await self._search_sat_wiki(query=query, limit=wanted)
+        except Exception as exc:
+            return {"output": None, "is_error": True, "error": str(exc)}
+
+        if not items:
+            return {
+                "output": _no_result_payload(query=query, label="卫星百科条目"),
+                "is_error": False,
+            }
+
+        return {
+            "output": {
+                "found": True,
+                "source": _SAT_WIKI_SOURCE,
+                "summary": _describe_sat_wiki_list(items, query=query),
+                "results": [_describe_sat_wiki_item(i) for i in items],
+                "total": total,
+            }
+        }
+
     @llm_tool(
         name="search_space_knowledge",
         description=(
@@ -1819,9 +2159,10 @@ class SpaceLaunchPlugin(NekoPluginBase):
         name="lookup_space_info",
         description=(
             "查询任何航天相关名词的权威资料，会自动依次检索航天数据库、"
-            "中文百科与网页。当用户询问某个火箭、卫星、航天器、机构或型号"
-            "（例如「UR-700A 是什么」「长征五号」）时优先调用这个工具。"
-            "如果三个来源都没有结果，返回值会明确说明未收录，请如实告诉用户。"
+            "百度百科、卫星百科（灰机wiki）与网页兜底搜索。当用户询问某个火箭、"
+            "卫星、航天器、机构或型号（例如「UR-700A 是什么」「长征五号」）时"
+            "优先调用这个工具。如果所有来源都没有结果，返回值会明确说明未收录，"
+            "请如实告诉用户。"
         ),
         parameters={
             "type": "object",
@@ -1891,6 +2232,25 @@ class SpaceLaunchPlugin(NekoPluginBase):
                 }
             attempts.append("百度百科：未收录")
 
+        # 2.5) 卫星百科（灰机wiki）：中文航天百科，覆盖火箭/卫星/发射场等
+        try:
+            sat_items, sat_total = await self._search_sat_wiki(query=query, limit=3)
+        except Exception:
+            sat_items, sat_total = [], 0
+            attempts.append("卫星百科：查询失败")
+        else:
+            if sat_items:
+                return {
+                    "output": {
+                        "found": True,
+                        "source": _SAT_WIKI_SOURCE,
+                        "summary": _describe_sat_wiki_list(sat_items, query=query),
+                        "results": [_describe_sat_wiki_item(i) for i in sat_items],
+                        "total": sat_total,
+                    }
+                }
+            attempts.append("卫星百科：未收录")
+
         # 3) 网页兜底
         try:
             web_items = await self._search_web(query, 5)
@@ -1914,7 +2274,7 @@ class SpaceLaunchPlugin(NekoPluginBase):
         payload = _no_result_payload(query=query, label="资料")
         payload["attempts"] = attempts
         payload["summary"] = (
-            f"三个来源都没有查到「{query}」：{'；'.join(attempts)}。"
+            f"所有来源都没有查到「{query}」：{'；'.join(attempts)}。"
             f"{_NO_RESULT_GUIDANCE}"
         )
         return {"output": payload, "is_error": False}

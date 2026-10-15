@@ -12,17 +12,22 @@ from plugin.plugins.space_launch import (
     _describe_launch,
     _describe_ll2_entity,
     _describe_ntrs_document,
+    _describe_sat_wiki_item,
+    _describe_sat_wiki_list,
     _filter_relevant_web_results,
     _humanize_delta,
     _is_still_upcoming,
     _join_names,
+    _looks_like_cloudflare_challenge,
     _no_result_payload,
     _parse_bing_rss,
     _parse_iso,
+    _strip_wiki_snippet,
     _summarize_baike_lemma,
     _summarize_launch,
     _summarize_ll2_entity,
     _summarize_ntrs_document,
+    _summarize_sat_wiki,
 )
 from plugin.sdk.plugin import SdkError
 
@@ -426,3 +431,135 @@ def test_parse_bing_rss() -> None:
 def test_parse_bing_rss_tolerates_invalid_xml() -> None:
     assert _parse_bing_rss("not xml at all") == []
     assert _parse_bing_rss("") == []
+
+
+# ---------------------------------------------------------------------------
+# 卫星百科（灰机wiki）检索
+# ---------------------------------------------------------------------------
+
+
+def test_strip_wiki_snippet_removes_tags_and_entities() -> None:
+    raw = '航天科技 <span class="searchmatch">长征</span>一号 | 1970&apos;年发射'
+    cleaned = _strip_wiki_snippet(raw)
+    assert "<span" not in cleaned
+    assert "searchmatch" not in cleaned
+    assert "长征" in cleaned
+    assert "1970'年发射" in cleaned
+
+
+def test_strip_wiki_snippet_handles_empty() -> None:
+    assert _strip_wiki_snippet("") == ""
+    assert _strip_wiki_snippet(None) == ""  # type: ignore[arg-type]
+
+
+def test_summarize_sat_wiki_builds_url_and_strips_snippet() -> None:
+    raw = {
+        "ns": 0,
+        "title": "长征一号",
+        "pageid": 3625,
+        "size": 26214,
+        "wordcount": 3602,
+        "snippet": '航天科技 <span class="searchmatch">长征</span>一号',
+        "timestamp": "2026-10-14T17:28:50Z",
+    }
+    item = _summarize_sat_wiki(raw, "https://sat.huijiwiki.com/")
+
+    assert item["title"] == "长征一号"
+    assert item["pageid"] == 3625
+    assert item["source"] == "卫星百科（灰机wiki）"
+    # 摘要应去掉高亮标签
+    assert item["snippet"] == "航天科技 长征一号"
+    # 规范链接：wiki/<URL 编码标题>
+    assert item["url"].startswith("https://sat.huijiwiki.com/wiki/")
+    assert "长征一号" not in item["url"]  # 中文已被编码
+    assert "%E9%95%BF%E5%BE%81%E4%B8%80%E5%8F%B7" in item["url"]
+
+
+def test_summarize_sat_wiki_handles_missing_snippet() -> None:
+    item = _summarize_sat_wiki({"title": "风云四号"}, "https://sat.huijiwiki.com/")
+    assert item["title"] == "风云四号"
+    assert item["snippet"] == ""
+    assert item["url"].endswith("/wiki/%E9%A3%8E%E4%BA%91%E5%9B%9B%E5%8F%B7")
+
+
+def test_describe_sat_wiki_item_mentions_facts() -> None:
+    item = {
+        "title": "长征一号",
+        "snippet": "我国第一款成功入轨的运载火箭",
+        "url": "https://sat.huijiwiki.com/wiki/%E9%95%BF%E5%BE%81%E4%B8%80%E5%8F%B7",
+    }
+    text = _describe_sat_wiki_item(item)
+
+    assert "卫星百科（灰机wiki）条目「长征一号」" in text
+    assert "我国第一款成功入轨的运载火箭" in text
+    assert "https://sat.huijiwiki.com/wiki/" in text
+
+
+def test_describe_sat_wiki_list_formatting() -> None:
+    items = [
+        {"title": "长征一号", "snippet": "第一款入轨火箭"},
+        {"title": "长征二号丙", "snippet": "衍生型号"},
+    ]
+    text = _describe_sat_wiki_list(items, query="长征")
+
+    assert "与「长征」相关的 2 个条目" in text
+    assert "1. 长征一号" in text
+    assert "2. 长征二号丙" in text
+    assert "第一款入轨火箭" in text
+
+
+def test_describe_sat_wiki_list_empty() -> None:
+    assert "没有找到" in _describe_sat_wiki_list([], query="UR-700A")
+
+
+# ---------------------------------------------------------------------------
+# 卫星百科的 Cloudflare 风控识别
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """只保留风控识别需要的两个属性。"""
+
+    def __init__(self, status_code: int = 200, headers=None, text: str = "") -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+
+
+def test_detects_cloudflare_challenge_via_header() -> None:
+    """实测灰机wiki 被拦截时返回 403 + cf-mitigated: challenge。"""
+    response = _FakeResponse(
+        status_code=403,
+        headers={"cf-mitigated": "challenge", "server": "cloudflare"},
+        text="<!DOCTYPE html><html><head><title>Just a moment...</title>",
+    )
+    assert _looks_like_cloudflare_challenge(response)
+
+
+def test_detects_cloudflare_challenge_via_body() -> None:
+    response = _FakeResponse(
+        status_code=403,
+        headers={"server": "cloudflare"},
+        text="... challenges.cloudflare.com ...",
+    )
+    assert _looks_like_cloudflare_challenge(response)
+
+
+def test_plain_403_is_not_a_challenge() -> None:
+    """普通 403（例如接口权限问题）不能被误判成风控。"""
+    response = _FakeResponse(
+        status_code=403,
+        headers={"server": "nginx"},
+        text='{"error":"forbidden"}',
+    )
+    assert not _looks_like_cloudflare_challenge(response)
+
+
+def test_normal_json_response_is_not_a_challenge() -> None:
+    response = _FakeResponse(
+        status_code=200,
+        headers={"server": "cloudflare"},
+        text='{"query":{"search":[]}}',
+    )
+    assert not _looks_like_cloudflare_challenge(response)
+

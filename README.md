@@ -9,8 +9,8 @@
 </p>
 
 查询全球**下一次**以及未来即将进行的太空发射任务，并支持跨来源检索航天资料：
-航天器、火箭型号、空间站、航天机构、宇航员、中文百科条目、NASA 技术文献，
-以及网页兜底搜索。
+航天器、火箭型号、空间站、航天机构、宇航员、中文百科条目、国内卫星百科
+（灰机wiki）、NASA 技术文献，以及网页兜底搜索。
 
 数据来源：
 
@@ -19,6 +19,7 @@
 | [Launch Library 2 API](https://thespacedevs.com/llapi) | 发射计划、航天器、火箭、机构、宇航员（The Space Devs，免费开放） |
 | [NASA NTRS](https://ntrs.nasa.gov/) | NASA 技术报告与会议论文（纯文字文献） |
 | [百度百科](https://baike.baidu.com/) | 中文航天条目（国内可直连） |
+| [卫星百科（灰机wiki）](https://sat.huijiwiki.com/) | 中文航天百科条目：火箭、卫星、航天器、发射场、机构等（国内可直连） |
 | [Bing](https://cn.bing.com/) | 上述来源都查不到时的网页兜底搜索 |
 
 ## 功能
@@ -30,6 +31,7 @@
 | `search_space_objects` | 航天器与机构检索 | 在 LL2 中检索航天器 / 火箭型号 / 空间站 / 航天机构 / 宇航员 |
 | `search_nasa_documents` | NASA 技术文献检索 | 在 NASA NTRS 中检索技术报告与会议论文（纯文字，含摘要与全文链接） |
 | `baike_search` | 中文百科检索 | 在百度百科中检索中文航天条目 |
+| `sat_wiki_search` | 卫星百科检索 | 在卫星百科（灰机wiki / sat.huijiwiki.com）中检索中文航天条目 |
 | `web_fallback_search` | 网页兜底搜索 | 前几个来源都查不到时，用 Bing 做一次网页搜索 |
 | `launch_stats` | 发射数据概览 | 返回即将进行的发射总数与当前 API 配置 |
 
@@ -51,7 +53,8 @@
 | `list_upcoming_space_launches` | “接下来有哪些发射任务” |
 | `search_space_knowledge` | “猎鹰九号是什么火箭”“国际空间站的资料” |
 | `search_nasa_literature` | “某项航天技术的原理 / 研究资料” |
-| `lookup_space_info` | 综合检索：先在 LL2、百度百科里找，都没有再走网页兜底 |
+| `lookup_satellite_wiki` | “风云四号是什么卫星”“文昌发射场”等卫星百科资料 |
+| `lookup_space_info` | 综合检索：先在 LL2、百度百科、卫星百科里找，都没有再走网页兜底 |
 
 ## 目录结构
 
@@ -82,6 +85,7 @@ space_launch/
 | `ntrs_base_url` | `https://ntrs.nasa.gov/` | NASA NTRS 接口基础地址 |
 | `baike_base_url` | `https://baike.baidu.com/` | 百度百科基础地址（中文航天资料） |
 | `bing_base_url` | `https://cn.bing.com/` | 网页兜底搜索基础地址 |
+| `huijiwiki_base_url` | `https://sat.huijiwiki.com/` | 卫星百科基础地址（灰机wiki / 中文航天资料） |
 | `timeout_seconds` | `15` | 单次请求超时（3–60 秒） |
 | `default_limit` | `5` | 列表默认返回条数 |
 | `include_descriptions` | `true` | 是否附带任务描述 |
@@ -111,6 +115,53 @@ Launch Library 2 的免费额度约为**每小时 15 次请求**。插件因此�
 { "limit": 5, "provider": "", "rocket": "", "location": "" }
 ```
 
+## 卫星百科检索示例
+
+`sat_wiki_search` 与 `lookup_satellite_wiki` 都走灰机wiki 的 MediaWiki
+标准接口 `api.php`（`action=query&list=search`），返回结构化 JSON。
+
+```json
+{ "query": "长征一号", "limit": 3 }
+```
+
+命中后的 `results` 形如：
+
+```json
+{
+  "found": true,
+  "source": "卫星百科（灰机wiki）",
+  "summary": "卫星百科（灰机wiki）中与「长征一号」相关的 2 个条目：\n1. 长征一号\n   我国第一款成功入轨的运载火箭…\n2. 长征一号丙\n   …",
+  "results": [
+    {
+      "source": "卫星百科（灰机wiki）",
+      "title": "长征一号",
+      "snippet": "我国第一款成功入轨的运载火箭，1970 年将东方红一号送入太空。",
+      "url": "https://sat.huijiwiki.com/wiki/%E9%95%BF%E5%BE%81%E4%B8%80%E5%8F%B7",
+      "pageid": 3625
+    }
+  ],
+  "count": 2,
+  "total": 2
+}
+```
+
+几点说明：
+
+- **摘要已清洗**：灰机wiki 的搜索摘要带 `<span class="searchmatch">` 高亮标签
+  和 HTML 实体，插件会去标签、反转义后再返回，便于直接朗读。
+- **链接是规范链接**：由条目标题 URL 编码拼成 `/wiki/<编码标题>`，
+  不依赖搜索结果里可能带跳转参数的原始链接。
+- **`lookup_space_info` 的调用顺序**：航天数据库（LL2 航天器 → LL2 火箭型号）
+  → 百度百科 → **卫星百科（灰机wiki）** → 网页兜底。任一来源命中即返回，
+  所以卫星百科只在百度百科也没收录时才会被请求。
+- **风控兜底**：机房 / 代理 IP 请求灰机wiki 常被 Cloudflare 拦成 HTTP 403
+  挑战页。插件识别到这种情况会明确返回「站点风控拦截了本次请求」，
+  并建议改用 `baike_search`，**不会**把风控页当作「未收录」，
+  也不会用旧缓存或猜测内容顶替。
+
+> **待补充**：`sat_wiki_search` 命中效果的实测截图需要在国内家用网络下运行后截取
+> （机房 / 代理 IP 会被灰机wiki 的 Cloudflare 风控拦掉，截不到有效结果）。
+> 截好后放到 [`assets/`](assets/) 目录，并把图片引用补到这一行。
 ## 返回示例
 
 `next_launch` 的 `summary` 字段是可直接朗读的中文描述：
@@ -167,8 +218,12 @@ uv run pytest plugin/plugins/space_launch/tests -q
 - `launches/upcoming/` 端点偶尔会返回刚刚发射完、状态尚未刷新的任务（例如已标记为
   `Launch Successful` 却仍排在列表开头的记录）。插件会过滤掉这些条目，确保
   「下一次太空发射」指向的确实是还没发射的任务；发射时间待定的任务排在列表末尾。
-- 只使用**国内可直连**的来源（LL2 / NASA NTRS / 百度百科 / Bing）。
+- 只使用**国内可直连**的来源（LL2 / NASA NTRS / 百度百科 / 卫星百科（灰机wiki）/ Bing）。
   Wikipedia 与 Wikidata 因需要代理，未被纳入。
+- 卫星百科（灰机wiki）开启了 Cloudflare 托管挑战；被拦截时接口返回 **HTTP 403
+  挑战页**（`cf-mitigated: challenge`）。插件会识别为风控并如实返回
+  「站点风控拦截了本次请求」，建议改用 `baike_search`，不会用旧缓存冒充或编造内容。
+  该风控主要针对机房 / 代理 IP，国内家用宽带一般可正常访问。
 
 ## 许可证
 

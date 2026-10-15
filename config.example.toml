@@ -11,6 +11,21 @@ ntrs_base_url = "https://ntrs.nasa.gov/"
 baike_base_url = "https://baike.baidu.com/"
 # 网页兜底搜索基础地址
 bing_base_url = "https://cn.bing.com/"
+# 国内卫星百科基础地址（灰机wiki / sat.huijiwiki.com，中文航天资料）
+#
+# 用途：sat_wiki_search / lookup_satellite_wiki 以及 lookup_space_info 的
+#       「百度百科之后、网页兜底之前」那一环，都会请求这个地址下的 api.php
+#       （MediaWiki 的 list=search 接口）来检索中文航天条目。
+#
+# 可替换性：填任意 MediaWiki 站点的根地址即可，插件只依赖 api.php 的
+#       action=query&list=search 标准接口，不依赖灰机wiki 的私有接口。
+#       因此换成其它灰机wiki 子站（如 https://sat.huijiwiki.com/ 之外的
+#       同类站点）或自建 MediaWiki 镜像同样可用，路径末尾的斜杠可有可无。
+#
+# 注意：灰机wiki 启用了 Cloudflare 风控，机房 / 代理 IP 常被拦截为
+#       HTTP 403 挑战页。插件会识别这种情况并如实返回「暂时无法访问」，
+#       不会把它当成「没有收录」，更不会编造内容。
+huijiwiki_base_url = "https://sat.huijiwiki.com/"
 # 单次请求超时（秒）
 timeout_seconds = 15
 # 默认返回的即将发射数量
